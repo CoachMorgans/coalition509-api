@@ -1,5 +1,5 @@
 # ============================================================
-# COALITION 509 SaaS — API Backend v1.0 (Flask)
+# COALITION 509 SaaS — API Backend v1.1 (Flask)
 # Compatible Python 3.14 — Pas de pydantic/rust
 # VoteConnect Ecosystem | ChallengeFinancier™
 # ============================================================
@@ -11,7 +11,8 @@ import bcrypt
 import jwt
 import os
 import json
-from datetime import datetime, timedelta
+import asyncio
+from datetime import datetime, timezone, timedelta
 
 # ============================================================
 # CONFIGURATION
@@ -23,18 +24,22 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:password@db.supa
 JWT_SECRET = os.getenv("JWT_SECRET", "coalition509-secret-key-change-in-production")
 JWT_EXPIRATION_HOURS = 24
 
-# Pool de connexions PostgreSQL
+# Pool de connexions PostgreSQL — initialisé UNE SEULE FOIS au démarrage
 db_pool = None
 
-@app.before_request
-def before_request():
+async def init_db_pool():
+    """Initialise le pool de connexions asyncpg."""
     global db_pool
     if db_pool is None:
-        import asyncio
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        db_pool = loop.run_until_complete(asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10))
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
         print("✅ Connexion PostgreSQL établie")
+    return db_pool
+
+def get_db_pool():
+    """Récupère le pool existant (doit être initialisé avant)."""
+    if db_pool is None:
+        raise RuntimeError("Le pool de base de données n'est pas initialisé. Appelez init_db_pool() d'abord.")
+    return db_pool
 
 # ============================================================
 # HELPERS
@@ -47,12 +52,13 @@ def verify_pin(pin: str, hashed: str) -> bool:
     return bcrypt.checkpw(pin.encode(), hashed.encode())
 
 def create_jwt(user_id: str, role: str, campaign_id=None):
+    now = datetime.now(timezone.utc)
     payload = {
         "sub": user_id,
         "role": role,
         "campaign_id": campaign_id,
-        "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS),
-        "iat": datetime.utcnow()
+        "exp": now + timedelta(hours=JWT_EXPIRATION_HOURS),
+        "iat": now
     }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
@@ -90,9 +96,16 @@ def require_role(allowed_roles):
         return decorated
     return decorator
 
-async def get_db():
-    async with db_pool.acquire() as conn:
-        return conn
+def run_async(coro):
+    """Exécute une coroutine async dans un contexte Flask synchrone."""
+    try:
+        loop = asyncio.get_running_loop()
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(asyncio.run, coro)
+            return future.result()
+    except RuntimeError:
+        return asyncio.run(coro)
 
 # ============================================================
 # ROUTES — AUTHENTIFICATION
@@ -114,12 +127,9 @@ def register():
     if not phone or not first_name or not last_name or not pin:
         return jsonify({"detail": "Champs obligatoires manquants"}), 400
 
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     async def _register():
-        async with db_pool.acquire() as conn:
+        pool = get_db_pool()
+        async with pool.acquire() as conn:
             existing = await conn.fetchrow("SELECT id FROM users WHERE phone = $1", phone)
             if existing:
                 return jsonify({"detail": "Ce numéro de téléphone est déjà enregistré"}), 400
@@ -142,7 +152,7 @@ def register():
 
             return jsonify(dict(row)), 201
 
-    return loop.run_until_complete(_register())
+    return run_async(_register())
 
 @app.route('/api/v1/auth/login', methods=['POST'])
 def login():
@@ -150,12 +160,9 @@ def login():
     phone = data.get('phone', '').strip()
     pin = data.get('pin', '')
 
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     async def _login():
-        async with db_pool.acquire() as conn:
+        pool = get_db_pool()
+        async with pool.acquire() as conn:
             row = await conn.fetchrow("""
                 SELECT id, phone, first_name, last_name, role, pin_hash, status
                 FROM users WHERE phone = $1
@@ -183,19 +190,16 @@ def login():
                 }
             })
 
-    return loop.run_until_complete(_login())
+    return run_async(_login())
 
 @app.route('/api/v1/auth/me', methods=['GET'])
 @require_auth
 def get_me():
     user_id = request.current_user['sub']
 
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     async def _get_me():
-        async with db_pool.acquire() as conn:
+        pool = get_db_pool()
+        async with pool.acquire() as conn:
             row = await conn.fetchrow("""
                 SELECT id, phone, first_name, last_name, email, role, profile_type,
                        region, commune, ngd_id, wallet_balance, cashback_balance, status, created_at
@@ -207,7 +211,7 @@ def get_me():
 
             return jsonify(dict(row))
 
-    return loop.run_until_complete(_get_me())
+    return run_async(_get_me())
 
 # ============================================================
 # ROUTES — CAMPAGNES
@@ -219,12 +223,9 @@ def list_campaigns():
     status = request.args.get('status')
     region = request.args.get('region')
 
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     async def _list():
-        async with db_pool.acquire() as conn:
+        pool = get_db_pool()
+        async with pool.acquire() as conn:
             query = """
                 SELECT id, name, slug, election_type, region, commune, 
                        election_date::text, status, owner_id::text, created_at
@@ -248,7 +249,7 @@ def list_campaigns():
             rows = await conn.fetch(query, *params)
             return jsonify([dict(r) for r in rows])
 
-    return loop.run_until_complete(_list())
+    return run_async(_list())
 
 @app.route('/api/v1/campaigns', methods=['POST'])
 @require_auth
@@ -262,12 +263,9 @@ def create_campaign():
     election_date = data.get('election_date') or None
     description = data.get('description', '').strip() or None
 
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     async def _create():
-        async with db_pool.acquire() as conn:
+        pool = get_db_pool()
+        async with pool.acquire() as conn:
             slug = name.lower().replace(" ", "-").replace("_", "-")[:100]
             base_slug = slug
             counter = 1
@@ -291,17 +289,14 @@ def create_campaign():
 
             return jsonify(dict(row)), 201
 
-    return loop.run_until_complete(_create())
+    return run_async(_create())
 
 @app.route('/api/v1/campaigns/<campaign_id>', methods=['GET'])
 @require_auth
 def get_campaign(campaign_id):
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     async def _get():
-        async with db_pool.acquire() as conn:
+        pool = get_db_pool()
+        async with pool.acquire() as conn:
             row = await conn.fetchrow("""
                 SELECT id, name, slug, election_type, region, commune, 
                        election_date::text, status, owner_id::text, created_at
@@ -313,23 +308,20 @@ def get_campaign(campaign_id):
 
             return jsonify(dict(row))
 
-    return loop.run_until_complete(_get())
+    return run_async(_get())
 
 @app.route('/api/v1/campaigns/<campaign_id>/stats', methods=['GET'])
 @require_auth
 def get_campaign_stats(campaign_id):
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     async def _get():
-        async with db_pool.acquire() as conn:
+        pool = get_db_pool()
+        async with pool.acquire() as conn:
             row = await conn.fetchrow("SELECT * FROM v_campaign_stats WHERE campaign_id = $1", campaign_id)
             if not row:
                 return jsonify({"detail": "Campagne non trouvée"}), 404
             return jsonify(dict(row))
 
-    return loop.run_until_complete(_get())
+    return run_async(_get())
 
 # ============================================================
 # ROUTES — GESTION D'ÉQUIPE
@@ -338,12 +330,9 @@ def get_campaign_stats(campaign_id):
 @app.route('/api/v1/campaigns/<campaign_id>/team', methods=['GET'])
 @require_auth
 def get_team_members(campaign_id):
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     async def _get():
-        async with db_pool.acquire() as conn:
+        pool = get_db_pool()
+        async with pool.acquire() as conn:
             rows = await conn.fetch("""
                 SELECT tm.id, tm.campaign_id::text, tm.user_id::text, tm.role, tm.permissions,
                        tm.status, tm.invited_at, tm.accepted_at,
@@ -361,7 +350,7 @@ def get_team_members(campaign_id):
             """, campaign_id)
             return jsonify([dict(r) for r in rows])
 
-    return loop.run_until_complete(_get())
+    return run_async(_get())
 
 @app.route('/api/v1/campaigns/<campaign_id>/team/invite', methods=['POST'])
 @require_auth
@@ -372,12 +361,9 @@ def invite_team_member(campaign_id):
     phone = data.get('phone', '').strip() or None
     role = data.get('role', '')
 
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     async def _invite():
-        async with db_pool.acquire() as conn:
+        pool = get_db_pool()
+        async with pool.acquire() as conn:
             campaign = await conn.fetchrow("SELECT id FROM campaigns WHERE id = $1", campaign_id)
             if not campaign:
                 return jsonify({"detail": "Campagne non trouvée"}), 404
@@ -409,7 +395,7 @@ def invite_team_member(campaign_id):
 
             return jsonify(dict(row)), 201
 
-    return loop.run_until_complete(_invite())
+    return run_async(_invite())
 
 # ============================================================
 # ROUTES — UTILISATEURS
@@ -426,12 +412,9 @@ def list_users():
     limit = int(request.args.get('limit', 50))
     offset = int(request.args.get('offset', 0))
 
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     async def _list():
-        async with db_pool.acquire() as conn:
+        pool = get_db_pool()
+        async with pool.acquire() as conn:
             query = """
                 SELECT id, phone, first_name, last_name, email, role, profile_type,
                        region, commune, ngd_id, wallet_balance, cashback_balance, status, created_at
@@ -461,7 +444,7 @@ def list_users():
             rows = await conn.fetch(query, *params)
             return jsonify([dict(r) for r in rows])
 
-    return loop.run_until_complete(_list())
+    return run_async(_list())
 
 @app.route('/api/v1/users/<user_id>/history', methods=['GET'])
 @require_auth
@@ -471,12 +454,9 @@ def get_user_history(user_id):
     if request.current_user['sub'] != user_id and request.current_user.get("role") not in ["superadmin", "admin", "manager"]:
         return jsonify({"detail": "Permission insuffisante"}), 403
 
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     async def _get():
-        async with db_pool.acquire() as conn:
+        pool = get_db_pool()
+        async with pool.acquire() as conn:
             rows = await conn.fetch("""
                 SELECT id, action_type, action_category, action_details, source, created_at
                 FROM activity_logs
@@ -486,7 +466,7 @@ def get_user_history(user_id):
             """, user_id, limit)
             return jsonify([dict(r) for r in rows])
 
-    return loop.run_until_complete(_get())
+    return run_async(_get())
 
 # ============================================================
 # ROUTES — COMMANDES TCL
@@ -501,12 +481,9 @@ def get_orders():
     limit = int(request.args.get('limit', 50))
     offset = int(request.args.get('offset', 0))
 
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     async def _get():
-        async with db_pool.acquire() as conn:
+        pool = get_db_pool()
+        async with pool.acquire() as conn:
             query = """
                 SELECT o.id, o.order_number, o.total_amount, o.status, o.payment_status,
                        o.created_at, o.region, o.commune,
@@ -533,7 +510,7 @@ def get_orders():
             rows = await conn.fetch(query, *params)
             return jsonify([dict(r) for r in rows])
 
-    return loop.run_until_complete(_get())
+    return run_async(_get())
 
 @app.route('/api/v1/orders', methods=['POST'])
 @require_auth
@@ -549,12 +526,9 @@ def create_order():
     cashback_comm = round(total * 0.025) if total >= 30000 else 0
     cashback_col = round(total * 0.01) if total >= 30000 else 0
 
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     async def _create():
-        async with db_pool.acquire() as conn:
+        pool = get_db_pool()
+        async with pool.acquire() as conn:
             order_number = await conn.fetchval("SELECT generate_order_number()")
 
             row = await conn.fetchrow("""
@@ -569,7 +543,7 @@ def create_order():
 
             return jsonify(dict(row)), 201
 
-    return loop.run_until_complete(_create())
+    return run_async(_create())
 
 # ============================================================
 # ROUTES — WALLET MI SIKAH
@@ -579,27 +553,21 @@ def create_order():
 @require_auth
 @require_role(["superadmin", "admin", "agent_croire"])
 def get_pending_withdrawals():
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     async def _get():
-        async with db_pool.acquire() as conn:
+        pool = get_db_pool()
+        async with pool.acquire() as conn:
             rows = await conn.fetch("SELECT * FROM v_pending_withdrawals")
             return jsonify([dict(r) for r in rows])
 
-    return loop.run_until_complete(_get())
+    return run_async(_get())
 
 @app.route('/api/v1/wallet/withdrawals/<tx_id>/validate', methods=['POST'])
 @require_auth
 @require_role(["superadmin", "admin", "agent_croire"])
 def validate_withdrawal(tx_id):
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     async def _validate():
-        async with db_pool.acquire() as conn:
+        pool = get_db_pool()
+        async with pool.acquire() as conn:
             tx = await conn.fetchrow("""
                 SELECT user_id, amount FROM wallet_transactions 
                 WHERE id = $1 AND type = 'withdrawal' AND withdrawal_status = 'pending'
@@ -620,7 +588,7 @@ def validate_withdrawal(tx_id):
 
             return jsonify({"message": "Retrait validé"})
 
-    return loop.run_until_complete(_validate())
+    return run_async(_validate())
 
 # ============================================================
 # ROUTES — CONFIGURATION
@@ -629,32 +597,26 @@ def validate_withdrawal(tx_id):
 @app.route('/api/v1/config', methods=['GET'])
 @require_auth
 def list_configs():
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     async def _get():
-        async with db_pool.acquire() as conn:
+        pool = get_db_pool()
+        async with pool.acquire() as conn:
             rows = await conn.fetch("SELECT config_key, config_value, config_type, description FROM system_config ORDER BY config_key")
             return jsonify([dict(r) for r in rows])
 
-    return loop.run_until_complete(_get())
+    return run_async(_get())
 
 @app.route('/api/v1/config/<key>', methods=['GET'])
 @require_auth
 def get_config(key):
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     async def _get():
-        async with db_pool.acquire() as conn:
+        pool = get_db_pool()
+        async with pool.acquire() as conn:
             row = await conn.fetchrow("SELECT config_key, config_value, config_type FROM system_config WHERE config_key = $1", key)
             if not row:
                 return jsonify({"detail": "Configuration non trouvée"}), 404
             return jsonify(dict(row))
 
-    return loop.run_until_complete(_get())
+    return run_async(_get())
 
 # ============================================================
 # ROUTES — DASHBOARD & HEALTH
@@ -664,7 +626,7 @@ def get_config(key):
 def root():
     return jsonify({
         "name": "Coalition 509 API",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "status": "operational",
         "ecosystem": "VoteConnect | ChallengeFinancier™",
         "author": "Coach Morgan's (Simplice KOUAME)"
@@ -672,21 +634,19 @@ def root():
 
 @app.route('/health')
 def health():
+    db_status = "connected" if db_pool else "disconnected"
     return jsonify({
         "status": "healthy",
-        "database": "connected" if db_pool else "disconnected",
-        "timestamp": datetime.utcnow().isoformat()
+        "database": db_status,
+        "timestamp": datetime.now(timezone.utc).isoformat()
     })
 
 @app.route('/api/v1/dashboard/stats', methods=['GET'])
 @require_auth
 def dashboard_stats():
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     async def _get():
-        async with db_pool.acquire() as conn:
+        pool = get_db_pool()
+        async with pool.acquire() as conn:
             stats = await conn.fetchrow("""
                 SELECT 
                     (SELECT COUNT(*) FROM users WHERE status = 'active') as total_users,
@@ -699,12 +659,14 @@ def dashboard_stats():
             """)
             return jsonify(dict(stats))
 
-    return loop.run_until_complete(_get())
+    return run_async(_get())
 
 # ============================================================
-# DÉMARRAGE
+# DÉMARRAGE — Initialisation du pool au lancement
 # ============================================================
 
 if __name__ == '__main__':
+    # Initialisation synchrone du pool au démarrage
+    asyncio.run(init_db_pool())
     port = int(os.getenv('PORT', 8000))
     app.run(host='0.0.0.0', port=port)
