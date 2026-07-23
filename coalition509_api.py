@@ -1,5 +1,5 @@
 # ============================================================
-# COALITION 509 SaaS — API Backend v1.1 (Flask)
+# COALITION 509 SaaS — API Backend v1.2 (Flask)
 # Compatible Python 3.14 — Pas de pydantic/rust
 # VoteConnect Ecosystem | ChallengeFinancier™
 # ============================================================
@@ -12,6 +12,7 @@ import jwt
 import os
 import json
 import asyncio
+import threading
 from datetime import datetime, timezone, timedelta
 
 # ============================================================
@@ -24,11 +25,12 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:password@db.supa
 JWT_SECRET = os.getenv("JWT_SECRET", "coalition509-secret-key-change-in-production")
 JWT_EXPIRATION_HOURS = 24
 
-# Pool de connexions PostgreSQL — initialisé UNE SEULE FOIS au démarrage
+# Pool de connexions PostgreSQL — initialisation lazy thread-safe
 db_pool = None
+_pool_lock = threading.Lock()
 
-async def init_db_pool():
-    """Initialise le pool de connexions asyncpg."""
+async def _create_pool():
+    """Crée le pool de connexions."""
     global db_pool
     if db_pool is None:
         db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
@@ -36,9 +38,12 @@ async def init_db_pool():
     return db_pool
 
 def get_db_pool():
-    """Récupère le pool existant (doit être initialisé avant)."""
+    """Récupère le pool, l'initialise si nécessaire (thread-safe)."""
+    global db_pool
     if db_pool is None:
-        raise RuntimeError("Le pool de base de données n'est pas initialisé. Appelez init_db_pool() d'abord.")
+        with _pool_lock:
+            if db_pool is None:
+                asyncio.run(_create_pool())
     return db_pool
 
 # ============================================================
@@ -626,7 +631,7 @@ def get_config(key):
 def root():
     return jsonify({
         "name": "Coalition 509 API",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "status": "operational",
         "ecosystem": "VoteConnect | ChallengeFinancier™",
         "author": "Coach Morgan's (Simplice KOUAME)"
@@ -634,7 +639,11 @@ def root():
 
 @app.route('/health')
 def health():
-    db_status = "connected" if db_pool else "disconnected"
+    try:
+        pool = get_db_pool()
+        db_status = "connected" if pool else "disconnected"
+    except Exception as e:
+        db_status = f"error: {str(e)}"
     return jsonify({
         "status": "healthy",
         "database": db_status,
@@ -662,11 +671,9 @@ def dashboard_stats():
     return run_async(_get())
 
 # ============================================================
-# DÉMARRAGE — Initialisation du pool au lancement
+# DÉMARRAGE
 # ============================================================
 
 if __name__ == '__main__':
-    # Initialisation synchrone du pool au démarrage
-    asyncio.run(init_db_pool())
     port = int(os.getenv('PORT', 8000))
     app.run(host='0.0.0.0', port=port)
