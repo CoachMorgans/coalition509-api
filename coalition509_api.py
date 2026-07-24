@@ -1,5 +1,5 @@
 # ============================================================
-# COALITION 509 SaaS — API Backend v2.0 (Flask + psycopg2)
+# COALITION 509 SaaS — API Backend v2.1 (Flask + psycopg2)
 # Compatible Python 3.14 — Synchrone et stable
 # VoteConnect Ecosystem | ChallengeFinancier™
 # ============================================================
@@ -8,7 +8,6 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from functools import wraps
 import psycopg2
-import psycopg2.extras
 import bcrypt
 import jwt
 import os
@@ -28,24 +27,22 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:password@db.supa
 JWT_SECRET = os.getenv("JWT_SECRET", "coalition509-secret-key-change-in-production")
 JWT_EXPIRATION_HOURS = 24
 
-# Pool de connexions simple
-db_pool = None
-
 def get_db():
-    """Récupère une connexion à la base de données."""
-    global db_pool
-    if db_pool is None:
-        db_pool = psycopg2.pool.ThreadedConnectionPool(
-            minconn=2, maxconn=10, dsn=DATABASE_URL,
-            sslmode='require'
-        )
-        print("✅ Connexion PostgreSQL établie")
-    return db_pool.getconn()
+    """Crée une nouvelle connexion à la base de données."""
+    conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+    return conn
 
-def release_db(conn):
-    """Libère une connexion."""
-    if db_pool:
-        db_pool.putconn(conn)
+def dict_from_row(cursor, row):
+    """Convertit une ligne en dictionnaire."""
+    if row is None:
+        return None
+    cols = [desc[0] for desc in cursor.description]
+    return dict(zip(cols, row))
+
+def dicts_from_rows(cursor, rows):
+    """Convertit plusieurs lignes en liste de dictionnaires."""
+    cols = [desc[0] for desc in cursor.description]
+    return [dict(zip(cols, row)) for row in rows]
 
 # ============================================================
 # HELPERS
@@ -102,18 +99,6 @@ def require_role(allowed_roles):
         return decorated
     return decorator
 
-def dict_from_row(cursor, row):
-    """Convertit une ligne en dictionnaire."""
-    if row is None:
-        return None
-    cols = [desc[0] for desc in cursor.description]
-    return dict(zip(cols, row))
-
-def dicts_from_rows(cursor, rows):
-    """Convertit plusieurs lignes en liste de dictionnaires."""
-    cols = [desc[0] for desc in cursor.description]
-    return [dict(zip(cols, row)) for row in rows]
-
 # ============================================================
 # ROUTES — AUTHENTIFICATION
 # ============================================================
@@ -137,12 +122,10 @@ def register():
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            # Vérifier si le téléphone existe déjà
             cur.execute("SELECT id FROM users WHERE phone = %s", (phone,))
             if cur.fetchone():
                 return jsonify({"detail": "Ce numéro de téléphone est déjà enregistré"}), 400
 
-            # Générer NGD ID
             cur.execute("SELECT generate_ngd_id()")
             ngd_id = cur.fetchone()[0]
 
@@ -159,7 +142,6 @@ def register():
             row = cur.fetchone()
             user = dict_from_row(cur, row)
 
-            # Log activité
             cur.execute("""
                 SELECT log_activity(%s, NULL, 'inscription', 'user', 
                                    %s::jsonb, 'user', %s, 'api')
@@ -172,7 +154,7 @@ def register():
         print(f"❌ Erreur register: {e}")
         return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 @app.route('/api/v1/auth/login', methods=['POST'])
 def login():
@@ -215,7 +197,7 @@ def login():
         print(f"❌ Erreur login: {e}")
         return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 @app.route('/api/v1/auth/me', methods=['GET'])
 @require_auth
@@ -240,7 +222,7 @@ def get_me():
         print(f"❌ Erreur get_me: {e}")
         return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 # ============================================================
 # ROUTES — CAMPAGNES
@@ -282,7 +264,7 @@ def list_campaigns():
         print(f"❌ Erreur list_campaigns: {e}")
         return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 @app.route('/api/v1/campaigns', methods=['POST'])
 @require_auth
@@ -332,7 +314,7 @@ def create_campaign():
         print(f"❌ Erreur create_campaign: {e}")
         return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 @app.route('/api/v1/campaigns/<campaign_id>', methods=['GET'])
 @require_auth
@@ -355,7 +337,7 @@ def get_campaign(campaign_id):
         print(f"❌ Erreur get_campaign: {e}")
         return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 @app.route('/api/v1/campaigns/<campaign_id>/stats', methods=['GET'])
 @require_auth
@@ -372,7 +354,7 @@ def get_campaign_stats(campaign_id):
         print(f"❌ Erreur get_campaign_stats: {e}")
         return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 # ============================================================
 # ROUTES — GESTION D'ÉQUIPE
@@ -405,7 +387,7 @@ def get_team_members(campaign_id):
         print(f"❌ Erreur get_team_members: {e}")
         return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 @app.route('/api/v1/campaigns/<campaign_id>/team/invite', methods=['POST'])
 @require_auth
@@ -458,7 +440,7 @@ def invite_team_member(campaign_id):
         print(f"❌ Erreur invite_team_member: {e}")
         return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 # ============================================================
 # ROUTES — UTILISATEURS
@@ -511,7 +493,7 @@ def list_users():
         print(f"❌ Erreur list_users: {e}")
         return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 @app.route('/api/v1/users/<user_id>/history', methods=['GET'])
 @require_auth
@@ -537,7 +519,7 @@ def get_user_history(user_id):
         print(f"❌ Erreur get_user_history: {e}")
         return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 # ============================================================
 # ROUTES — COMMANDES TCL
@@ -585,7 +567,7 @@ def get_orders():
         print(f"❌ Erreur get_orders: {e}")
         return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 @app.route('/api/v1/orders', methods=['POST'])
 @require_auth
@@ -625,7 +607,7 @@ def create_order():
         print(f"❌ Erreur create_order: {e}")
         return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 # ============================================================
 # ROUTES — WALLET MI SIKAH
@@ -645,7 +627,7 @@ def get_pending_withdrawals():
         print(f"❌ Erreur get_pending_withdrawals: {e}")
         return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 @app.route('/api/v1/wallet/withdrawals/<tx_id>/validate', methods=['POST'])
 @require_auth
@@ -680,7 +662,7 @@ def validate_withdrawal(tx_id):
         print(f"❌ Erreur validate_withdrawal: {e}")
         return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 # ============================================================
 # ROUTES — CONFIGURATION
@@ -699,7 +681,7 @@ def list_configs():
         print(f"❌ Erreur list_configs: {e}")
         return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 @app.route('/api/v1/config/<key>', methods=['GET'])
 @require_auth
@@ -716,7 +698,7 @@ def get_config(key):
         print(f"❌ Erreur get_config: {e}")
         return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 # ============================================================
 # ROUTES — DASHBOARD & HEALTH
@@ -726,7 +708,7 @@ def get_config(key):
 def root():
     return jsonify({
         "name": "Coalition 509 API",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "status": "operational",
         "ecosystem": "VoteConnect | ChallengeFinancier™",
         "author": "Coach Morgan's (Simplice KOUAME)"
@@ -739,7 +721,7 @@ def health():
         with conn.cursor() as cur:
             cur.execute("SELECT 1")
             cur.fetchone()
-        release_db(conn)
+        conn.close()
         db_status = "connected"
     except Exception as e:
         db_status = f"error: {str(e)}"
@@ -771,7 +753,7 @@ def dashboard_stats():
         print(f"❌ Erreur dashboard_stats: {e}")
         return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 # ============================================================
 # DÉMARRAGE
