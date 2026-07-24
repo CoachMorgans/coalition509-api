@@ -1,9 +1,9 @@
 # Coalition 509 SaaS — Dépendances Flask
-# Compatible Python 3.14 — Pas de compilation Rust
+# Compatible Python 3.14 — Synchrone (psycopg2)
 
 flask==3.0.3
 flask-cors==5.0.0
-asyncpg==0.30.0
+psycopg2-binary==2.9.10
 bcrypt==4.2.0
 pyjwt==2.9.0
 python-dotenv==1.0.1
