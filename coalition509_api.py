@@ -1,5 +1,5 @@
 # ============================================================
-# COALITION 509 SaaS — API Backend v1.2 (Flask)
+# COALITION 509 SaaS — API Backend v1.3 (Flask)
 # Compatible Python 3.14 — Pas de pydantic/rust
 # VoteConnect Ecosystem | ChallengeFinancier™
 # ============================================================
@@ -7,6 +7,7 @@
 from flask import Flask, request, jsonify
 from functools import wraps
 import asyncpg
+from flask_cors import CORS
 import bcrypt
 import jwt
 import os
@@ -20,6 +21,9 @@ from datetime import datetime, timezone, timedelta
 # ============================================================
 app = Flask(__name__)
 app.config['JSON_SORT_KEYS'] = False
+
+# CORS — Autorise toutes les origines (à restreindre en production)
+CORS(app, resources={r'/api/*': {'origins': '*'}}, supports_credentials=True)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:password@db.supabase.co:5432/postgres")
 JWT_SECRET = os.getenv("JWT_SECRET", "coalition509-secret-key-change-in-production")
