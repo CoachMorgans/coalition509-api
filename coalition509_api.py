@@ -13,6 +13,8 @@ import jwt
 import os
 import json
 import uuid
+import secrets
+import time
 from datetime import datetime, timezone, timedelta
 
 # ============================================================
@@ -98,6 +100,11 @@ def require_role(allowed_roles):
             return f(*args, **kwargs)
         return decorated
     return decorator
+
+# ═══════════════════════════════════════════════════════════════
+#  STOCKAGE TOKENS BOT (mémoire — tokens jetables 5 min)
+# ═══════════════════════════════════════════════════════════════
+_bot_tokens = {}
 
 # ============================================================
 # ROUTES — AUTHENTIFICATION
@@ -754,6 +761,87 @@ def dashboard_stats():
         return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
     finally:
         conn.close()
+
+# ═══════════════════════════════════════════════════════════════
+#  ROUTES — AUTH BOT → SAAS (NOUVEAUTÉ v2.2)
+# ═══════════════════════════════════════════════════════════════
+
+@app.route('/api/auth/bot-token', methods=['POST'])
+def bot_token():
+    """
+    Appelé par le Bot Challenger pour générer un token jetable.
+    Body JSON: {"telegram_id": "123456789", "telephone": "0022501..."}
+    """
+    data = request.get_json()
+    tid = data.get('telegram_id')
+    tel = data.get('telephone')
+
+    if not tid or not tel:
+        return jsonify({"ok": False, "error": "telegram_id and telephone required"}), 400
+
+    token = secrets.token_urlsafe(24)
+    _bot_tokens[token] = {
+        "telegram_id": str(tid),
+        "telephone": str(tel),
+        "exp": time.time() + 300  # 5 minutes
+    }
+    return jsonify({"ok": True, "token": token})
+
+
+@app.route('/api/auth/verify-bot-token', methods=['POST'])
+def verify_bot_token():
+    """
+    Appelé par le Frontend SaaS au chargement (paramètre ?bot_auth=TOKEN).
+    Body JSON: {"token": "xxx"}
+    """
+    data = request.get_json()
+    token = data.get('token')
+
+    if not token or token not in _bot_tokens:
+        return jsonify({"ok": False, "error": "Invalid token"}), 401
+
+    info = _bot_tokens[token]
+    if time.time() > info["exp"]:
+        del _bot_tokens[token]
+        return jsonify({"ok": False, "error": "Expired"}), 401
+
+    # Recherche l'utilisateur par téléphone dans la DB
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, phone, first_name, last_name, role, profile_type,
+                       region, commune, ngd_id, wallet_balance, cashback_balance, status
+                FROM users WHERE phone = %s
+            """, (info["telephone"],))
+            row = cur.fetchone()
+            if not row:
+                del _bot_tokens[token]
+                return jsonify({"ok": False, "error": "User not found"}), 404
+
+            user = dict_from_row(cur, row)
+    except Exception as e:
+        print(f"❌ Erreur verify_bot_token DB: {e}")
+        return jsonify({"ok": False, "error": "DB error"}), 500
+    finally:
+        conn.close()
+
+    del _bot_tokens[token]  # one-time use
+
+    return jsonify({
+        "ok": True,
+        "user": {
+            "id": str(user.get("id", "")),
+            "telephone": user.get("phone", ""),
+            "prenom": user.get("first_name", ""),
+            "nom": user.get("last_name", ""),
+            "profil": user.get("profile_type", ""),
+            "id_ngd": user.get("ngd_id", ""),
+            "region": user.get("region", ""),
+            "commune": user.get("commune", "")
+        }
+    })
+
 
 # ============================================================
 # DÉMARRAGE
