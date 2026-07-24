@@ -832,11 +832,11 @@ def verify_bot_token():
         "ok": True,
         "user": {
             "id": str(user.get("id", "")),
-            "telephone": user.get("phone", ""),
-            "prenom": user.get("first_name", ""),
-            "nom": user.get("last_name", ""),
-            "profil": user.get("profile_type", ""),
-            "id_ngd": user.get("ngd_id", ""),
+            "phone": user.get("phone", ""),
+            "first_name": user.get("first_name", ""),
+            "last_name": user.get("last_name", ""),
+            "profile_type": user.get("profile_type", ""),
+            "ngd_id": user.get("ngd_id", ""),
             "region": user.get("region", ""),
             "commune": user.get("commune", "")
         }
