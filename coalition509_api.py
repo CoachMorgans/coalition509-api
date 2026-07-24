@@ -816,8 +816,13 @@ def verify_bot_token():
             """, (info["telephone"],))
             row = cur.fetchone()
             if not row:
+                # Utilisateur pas encore dans le SaaS → redirige vers inscription
                 del _bot_tokens[token]
-                return jsonify({"ok": False, "error": "User not found"}), 404
+                return jsonify({
+                    "ok": True,
+                    "needs_registration": True,
+                    "phone": info["telephone"]
+                })
 
             user = dict_from_row(cur, row)
     except Exception as e:
