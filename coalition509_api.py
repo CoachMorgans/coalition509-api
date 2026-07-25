@@ -1,7 +1,7 @@
 """
 Coalition 509 — Backend SaaS
 VoteConnect Ecosystem | ChallengeFinancier™
-Version : 2.3.1 (Render-stable, connexion directe)
+Version : 2.3.2 (Compat bcrypt + werkzeug hash)
 Auteur  : Coach Morgan's (Simplice KOUAME)
 """
 
@@ -10,6 +10,7 @@ import re
 import uuid
 import jwt
 import psycopg2
+import bcrypt
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
@@ -34,17 +35,15 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL manquante dans les variables d'environnement.")
 
 # ═══════════════════════════════════════════════════════════════════
-# DATABASE — Connexion directe (plus stable sur Render)
+# DATABASE
 # ═══════════════════════════════════════════════════════════════════
 
 def get_db():
-    """Crée une connexion fraîche à chaque appel."""
     conn = psycopg2.connect(DATABASE_URL)
     conn.autocommit = False
     return conn
 
 def init_db():
-    """Crée les tables si elles n'existent pas. Ne crashe jamais au boot."""
     try:
         conn = get_db()
         with conn.cursor() as cur:
@@ -108,10 +107,38 @@ def init_db():
         app.logger.info("[INIT_DB] Tables OK")
     except Exception as e:
         app.logger.error(f"[INIT_DB] {e}")
-        # On ne crashe PAS le serveur si la DB est temporairement inaccessible
 
 # ═══════════════════════════════════════════════════════════════════
-# JWT MIDDLEWARE
+# HASH COMPAT — bcrypt (anciens) + werkzeug (nouveaux)
+# ═══════════════════════════════════════════════════════════════════
+
+def hash_pin(pin):
+    """Nouveaux utilisateurs : werkzeug pbkdf2:sha256"""
+    return generate_password_hash(pin)
+
+def verify_pin(pin, stored_hash):
+    """
+    Essaie werkzeug d'abord, fallback bcrypt si ancien hash.
+    Retourne True si le PIN correspond.
+    """
+    # 1. Werkzeug (nouveaux utilisateurs)
+    try:
+        if check_password_hash(stored_hash, pin):
+            return True
+    except Exception:
+        pass  # hash format incompatible → essayer bcrypt
+
+    # 2. Bcrypt (anciens utilisateurs)
+    try:
+        if bcrypt.checkpw(pin.encode('utf-8'), stored_hash.encode('utf-8')):
+            return True
+    except Exception:
+        pass
+
+    return False
+
+# ═══════════════════════════════════════════════════════════════════
+# JWT
 # ═══════════════════════════════════════════════════════════════════
 
 def generate_ngd_id():
@@ -173,19 +200,19 @@ def jwt_middleware():
                 conn.close()
 
 # ═══════════════════════════════════════════════════════════════════
-# HEALTH CHECK
+# HEALTH
 # ═══════════════════════════════════════════════════════════════════
 
 @app.route('/')
 def root():
-    return jsonify({"status": "Coalition 509 API is running", "version": "2.3.1"})
+    return jsonify({"status": "Coalition 509 API is running", "version": "2.3.2"})
 
 @app.route('/health')
 def health():
     return jsonify({"status": "ok"})
 
 # ═══════════════════════════════════════════════════════════════════
-# AUTH ROUTES
+# AUTH
 # ═══════════════════════════════════════════════════════════════════
 
 @app.route('/api/v1/auth/register', methods=['POST'])
@@ -215,7 +242,7 @@ def register():
                 return jsonify({"detail": "Ce numéro est déjà inscrit."}), 409
 
             ngd_id = generate_ngd_id()
-            pin_hash = generate_password_hash(pin)
+            pin_hash = hash_pin(pin)
             role = 'admin' if profile_type.lower() in ['coach', 'superadmin'] else 'user'
 
             cur.execute("""
@@ -255,7 +282,11 @@ def login():
                 FROM users WHERE phone = %s
             """, [phone])
             row = cur.fetchone()
-            if not row or not check_password_hash(row[11], pin):
+            if not row:
+                return jsonify({"detail": "Identifiants incorrects."}), 401
+
+            stored_hash = row[11]
+            if not verify_pin(pin, stored_hash):
                 return jsonify({"detail": "Identifiants incorrects."}), 401
 
             user = {
@@ -314,7 +345,7 @@ def verify_bot_token():
         conn.close()
 
 # ═══════════════════════════════════════════════════════════════════
-# USERS ROUTES
+# USERS
 # ═══════════════════════════════════════════════════════════════════
 
 @app.route('/api/v1/users', methods=['GET'])
@@ -349,7 +380,7 @@ def list_users():
         conn.close()
 
 # ═══════════════════════════════════════════════════════════════════
-# ORDERS ROUTES
+# ORDERS
 # ═══════════════════════════════════════════════════════════════════
 
 @app.route('/api/v1/orders', methods=['GET'])
@@ -389,7 +420,7 @@ def list_orders():
         conn.close()
 
 # ═══════════════════════════════════════════════════════════════════
-# CAMPAIGNS ROUTES
+# CAMPAIGNS
 # ═══════════════════════════════════════════════════════════════════
 
 def slugify(name):
