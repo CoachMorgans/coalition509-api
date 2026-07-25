@@ -1,7 +1,7 @@
 """
 Coalition 509 — Backend SaaS
 VoteConnect Ecosystem | ChallengeFinancier™
-Version : 2.3.0 (Campagnes tarifées + routes consolidées)
+Version : 2.3.1 (Render-stable, connexion directe)
 Auteur  : Coach Morgan's (Simplice KOUAME)
 """
 
@@ -10,9 +10,7 @@ import re
 import uuid
 import jwt
 import psycopg2
-from psycopg2.extras import RealDictCursor
 from datetime import datetime, timedelta
-from functools import wraps
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -36,31 +34,20 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL manquante dans les variables d'environnement.")
 
 # ═══════════════════════════════════════════════════════════════════
-# DATABASE POOL
+# DATABASE — Connexion directe (plus stable sur Render)
 # ═══════════════════════════════════════════════════════════════════
 
-_db_pool = None
-
 def get_db():
-    global _db_pool
-    if _db_pool is None:
-        _db_pool = psycopg2.pool.ThreadedConnectionPool(
-            minconn=1, maxconn=10, dsn=DATABASE_URL
-        )
-    conn = _db_pool.getconn()
+    """Crée une connexion fraîche à chaque appel."""
+    conn = psycopg2.connect(DATABASE_URL)
     conn.autocommit = False
     return conn
 
-def release_db(conn):
-    if _db_pool and conn:
-        _db_pool.putconn(conn)
-
 def init_db():
-    """Crée les tables si elles n'existent pas."""
-    conn = get_db()
+    """Crée les tables si elles n'existent pas. Ne crashe jamais au boot."""
     try:
+        conn = get_db()
         with conn.cursor() as cur:
-            # Users
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -79,7 +66,6 @@ def init_db():
                     updated_at TIMESTAMP DEFAULT NOW()
                 );
             """)
-            # Orders
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS orders (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -93,7 +79,6 @@ def init_db():
                     created_at TIMESTAMP DEFAULT NOW()
                 );
             """)
-            # Campaigns
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS campaigns (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -114,17 +99,16 @@ def init_db():
                     updated_at TIMESTAMP DEFAULT NOW()
                 );
             """)
-            # Indexes
             cur.execute("CREATE INDEX IF NOT EXISTS idx_users_phone ON users(phone);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_campaigns_status ON campaigns(status);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_campaigns_region ON campaigns(region);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_campaigns_created ON campaigns(created_at DESC);")
             conn.commit()
+        conn.close()
+        app.logger.info("[INIT_DB] Tables OK")
     except Exception as e:
-        conn.rollback()
         app.logger.error(f"[INIT_DB] {e}")
-    finally:
-        release_db(conn)
+        # On ne crashe PAS le serveur si la DB est temporairement inaccessible
 
 # ═══════════════════════════════════════════════════════════════════
 # JWT MIDDLEWARE
@@ -186,7 +170,7 @@ def jwt_middleware():
                             "region": row[8], "commune": row[9], "status": row[10]
                         }
             finally:
-                release_db(conn)
+                conn.close()
 
 # ═══════════════════════════════════════════════════════════════════
 # HEALTH CHECK
@@ -194,7 +178,7 @@ def jwt_middleware():
 
 @app.route('/')
 def root():
-    return jsonify({"status": "Coalition 509 API is running", "version": "2.3.0"})
+    return jsonify({"status": "Coalition 509 API is running", "version": "2.3.1"})
 
 @app.route('/health')
 def health():
@@ -251,7 +235,7 @@ def register():
         conn.rollback()
         return jsonify({"detail": str(e)}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 @app.route('/api/v1/auth/login', methods=['POST'])
 def login():
@@ -285,7 +269,7 @@ def login():
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 @app.route('/api/v1/auth/me', methods=['GET'])
 def me():
@@ -301,8 +285,6 @@ def verify_bot_token():
     if not token:
         return jsonify({"ok": False, "error": "Token manquant"}), 400
 
-    # TODO: implémenter la vérification réelle du token bot
-    # Pour l'instant, on simule une réponse positive si le token contient un phone
     phone = data.get('phone', '')
     if not phone and '_' in token:
         phone = token.split('_')[0]
@@ -329,7 +311,7 @@ def verify_bot_token():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 # ═══════════════════════════════════════════════════════════════════
 # USERS ROUTES
@@ -364,7 +346,7 @@ def list_users():
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 # ═══════════════════════════════════════════════════════════════════
 # ORDERS ROUTES
@@ -404,10 +386,10 @@ def list_orders():
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 # ═══════════════════════════════════════════════════════════════════
-# CAMPAIGNS ROUTES (NOUVEAU)
+# CAMPAIGNS ROUTES
 # ═══════════════════════════════════════════════════════════════════
 
 def slugify(name):
@@ -476,7 +458,7 @@ def list_campaigns():
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 @app.route('/api/v1/campaigns', methods=['POST'])
 def create_campaign():
@@ -525,7 +507,7 @@ def create_campaign():
         conn.rollback()
         return jsonify({"detail": str(e)}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 @app.route('/api/v1/campaigns/<campaign_id>', methods=['GET'])
 def get_campaign(campaign_id):
@@ -557,7 +539,7 @@ def get_campaign(campaign_id):
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 # ═══════════════════════════════════════════════════════════════════
 # DASHBOARD STATS
@@ -584,7 +566,6 @@ def dashboard_stats():
             cur.execute("SELECT COALESCE(SUM(price_total),0) FROM campaigns WHERE status='active'")
             total_revenue = float(cur.fetchone()[0])
 
-            # Tables optionnelles — on gère l'absence gracieusement
             try:
                 cur.execute("SELECT COUNT(*) FROM groups WHERE status='active'")
                 total_groups = cur.fetchone()[0]
@@ -608,7 +589,7 @@ def dashboard_stats():
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
     finally:
-        release_db(conn)
+        conn.close()
 
 # ═══════════════════════════════════════════════════════════════════
 # ERROR HANDLERS
