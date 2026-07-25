@@ -1,7 +1,7 @@
 """
 Coalition 509 — Backend SaaS
 VoteConnect Ecosystem | ChallengeFinancier™
-Version : 2.3.2 (Compat bcrypt + werkzeug hash)
+Version : 2.3.3 (Stats résilientes + tables auto)
 Auteur  : Coach Morgan's (Simplice KOUAME)
 """
 
@@ -43,10 +43,18 @@ def get_db():
     conn.autocommit = False
     return conn
 
+def table_exists(cur, table_name):
+    cur.execute("""
+        SELECT 1 FROM information_schema.tables 
+        WHERE table_schema = 'public' AND table_name = %s
+    """, [table_name])
+    return cur.fetchone() is not None
+
 def init_db():
     try:
         conn = get_db()
         with conn.cursor() as cur:
+            # Users
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -65,6 +73,7 @@ def init_db():
                     updated_at TIMESTAMP DEFAULT NOW()
                 );
             """)
+            # Orders
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS orders (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -78,6 +87,7 @@ def init_db():
                     created_at TIMESTAMP DEFAULT NOW()
                 );
             """)
+            # Campaigns
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS campaigns (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -113,28 +123,19 @@ def init_db():
 # ═══════════════════════════════════════════════════════════════════
 
 def hash_pin(pin):
-    """Nouveaux utilisateurs : werkzeug pbkdf2:sha256"""
     return generate_password_hash(pin)
 
 def verify_pin(pin, stored_hash):
-    """
-    Essaie werkzeug d'abord, fallback bcrypt si ancien hash.
-    Retourne True si le PIN correspond.
-    """
-    # 1. Werkzeug (nouveaux utilisateurs)
     try:
         if check_password_hash(stored_hash, pin):
             return True
     except Exception:
-        pass  # hash format incompatible → essayer bcrypt
-
-    # 2. Bcrypt (anciens utilisateurs)
+        pass
     try:
         if bcrypt.checkpw(pin.encode('utf-8'), stored_hash.encode('utf-8')):
             return True
     except Exception:
         pass
-
     return False
 
 # ═══════════════════════════════════════════════════════════════════
@@ -205,7 +206,7 @@ def jwt_middleware():
 
 @app.route('/')
 def root():
-    return jsonify({"status": "Coalition 509 API is running", "version": "2.3.2"})
+    return jsonify({"status": "Coalition 509 API is running", "version": "2.3.3"})
 
 @app.route('/health')
 def health():
@@ -573,7 +574,7 @@ def get_campaign(campaign_id):
         conn.close()
 
 # ═══════════════════════════════════════════════════════════════════
-# DASHBOARD STATS
+# DASHBOARD STATS — RÉSILIEN PAR TABLE
 # ═══════════════════════════════════════════════════════════════════
 
 @app.route('/api/v1/dashboard/stats', methods=['GET'])
@@ -583,41 +584,65 @@ def dashboard_stats():
         return jsonify({"detail": "Non authentifié."}), 401
 
     conn = get_db()
+    stats = {
+        "total_users": 0,
+        "total_campaigns": 0,
+        "total_orders": 0,
+        "total_revenue": 0.0,
+        "total_groups": 0,
+        "pending_withdrawals": 0.0
+    }
+
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM users WHERE status='active'")
-            total_users = cur.fetchone()[0]
-
-            cur.execute("SELECT COUNT(*) FROM campaigns WHERE status='active'")
-            total_campaigns = cur.fetchone()[0]
-
-            cur.execute("SELECT COUNT(*) FROM orders")
-            total_orders = cur.fetchone()[0]
-
-            cur.execute("SELECT COALESCE(SUM(price_total),0) FROM campaigns WHERE status='active'")
-            total_revenue = float(cur.fetchone()[0])
-
+            # Users
             try:
-                cur.execute("SELECT COUNT(*) FROM groups WHERE status='active'")
-                total_groups = cur.fetchone()[0]
-            except:
-                total_groups = 0
+                cur.execute("SELECT COUNT(*) FROM users WHERE status='active'")
+                stats["total_users"] = cur.fetchone()[0]
+            except Exception as e:
+                app.logger.warning(f"[STATS] users: {e}")
 
+            # Campaigns
             try:
-                cur.execute("SELECT COALESCE(SUM(amount),0) FROM withdrawals WHERE status='pending'")
-                pending_withdrawals = float(cur.fetchone()[0])
-            except:
-                pending_withdrawals = 0
+                if table_exists(cur, 'campaigns'):
+                    cur.execute("SELECT COUNT(*) FROM campaigns WHERE status='active'")
+                    stats["total_campaigns"] = cur.fetchone()[0]
+                    cur.execute("SELECT COALESCE(SUM(price_total),0) FROM campaigns WHERE status='active'")
+                    stats["total_revenue"] = float(cur.fetchone()[0])
+                else:
+                    app.logger.warning("[STATS] Table campaigns inexistante")
+            except Exception as e:
+                app.logger.warning(f"[STATS] campaigns: {e}")
 
-            return jsonify({
-                "total_users": total_users,
-                "total_campaigns": total_campaigns,
-                "total_orders": total_orders,
-                "total_revenue": total_revenue,
-                "total_groups": total_groups,
-                "pending_withdrawals": pending_withdrawals
-            }), 200
+            # Orders
+            try:
+                if table_exists(cur, 'orders'):
+                    cur.execute("SELECT COUNT(*) FROM orders")
+                    stats["total_orders"] = cur.fetchone()[0]
+                else:
+                    app.logger.warning("[STATS] Table orders inexistante")
+            except Exception as e:
+                app.logger.warning(f"[STATS] orders: {e}")
+
+            # Groups
+            try:
+                if table_exists(cur, 'groups'):
+                    cur.execute("SELECT COUNT(*) FROM groups WHERE status='active'")
+                    stats["total_groups"] = cur.fetchone()[0]
+            except Exception as e:
+                app.logger.warning(f"[STATS] groups: {e}")
+
+            # Withdrawals
+            try:
+                if table_exists(cur, 'withdrawals'):
+                    cur.execute("SELECT COALESCE(SUM(amount),0) FROM withdrawals WHERE status='pending'")
+                    stats["pending_withdrawals"] = float(cur.fetchone()[0])
+            except Exception as e:
+                app.logger.warning(f"[STATS] withdrawals: {e}")
+
+        return jsonify(stats), 200
     except Exception as e:
+        app.logger.error(f"[STATS] Global error: {e}")
         return jsonify({"detail": str(e)}), 500
     finally:
         conn.close()
