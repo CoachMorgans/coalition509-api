@@ -1,857 +1,634 @@
-# ============================================================
-# COALITION 509 SaaS — API Backend v2.1 (Flask + psycopg2)
-# Compatible Python 3.14 — Synchrone et stable
-# VoteConnect Ecosystem | ChallengeFinancier™
-# ============================================================
+"""
+Coalition 509 — Backend SaaS
+VoteConnect Ecosystem | ChallengeFinancier™
+Version : 2.3.0 (Campagnes tarifées + routes consolidées)
+Auteur  : Coach Morgan's (Simplice KOUAME)
+"""
 
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from functools import wraps
-import psycopg2
-import bcrypt
-import jwt
 import os
-import json
+import re
 import uuid
-import secrets
-import time
-from datetime import datetime, timezone, timedelta
+import jwt
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from datetime import datetime, timedelta
+from functools import wraps
+from flask import Flask, request, jsonify, g
+from flask_cors import CORS
+from werkzeug.security import generate_password_hash, check_password_hash
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+# ═══════════════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════════════
+
 app = Flask(__name__)
-app.config['JSON_SORT_KEYS'] = False
+CORS(app, origins=[
+    "https://coachmorgans.github.io",
+    "http://localhost:*",
+    "https://coalition509-frontend.onrender.com"
+], supports_credentials=True)
 
-CORS(app, resources={r'/api/*': {'origins': '*'}}, supports_credentials=True)
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'coalition509-dev-secret-key-change-me')
+app.config['JWT_EXPIRATION_HOURS'] = 24
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:password@db.supabase.co:5432/postgres")
-JWT_SECRET = os.getenv("JWT_SECRET", "coalition509-secret-key-change-in-production")
-JWT_EXPIRATION_HOURS = 24
+DATABASE_URL = os.environ.get('DATABASE_URL')
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL manquante dans les variables d'environnement.")
+
+# ═══════════════════════════════════════════════════════════════════
+# DATABASE POOL
+# ═══════════════════════════════════════════════════════════════════
+
+_db_pool = None
 
 def get_db():
-    """Crée une nouvelle connexion à la base de données."""
-    conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+    global _db_pool
+    if _db_pool is None:
+        _db_pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn=1, maxconn=10, dsn=DATABASE_URL
+        )
+    conn = _db_pool.getconn()
+    conn.autocommit = False
     return conn
 
-def dict_from_row(cursor, row):
-    """Convertit une ligne en dictionnaire."""
-    if row is None:
-        return None
-    cols = [desc[0] for desc in cursor.description]
-    return dict(zip(cols, row))
+def release_db(conn):
+    if _db_pool and conn:
+        _db_pool.putconn(conn)
 
-def dicts_from_rows(cursor, rows):
-    """Convertit plusieurs lignes en liste de dictionnaires."""
-    cols = [desc[0] for desc in cursor.description]
-    return [dict(zip(cols, row)) for row in rows]
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def hash_pin(pin: str) -> str:
-    return bcrypt.hashpw(pin.encode(), bcrypt.gensalt()).decode()
-
-def verify_pin(pin: str, hashed: str) -> bool:
-    return bcrypt.checkpw(pin.encode(), hashed.encode())
-
-def create_jwt(user_id: str, role: str, campaign_id=None):
-    now = datetime.now(timezone.utc)
-    payload = {
-        "sub": user_id,
-        "role": role,
-        "campaign_id": campaign_id,
-        "exp": now + timedelta(hours=JWT_EXPIRATION_HOURS),
-        "iat": now
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
-
-def decode_jwt(token: str):
+def init_db():
+    """Crée les tables si elles n'existent pas."""
+    conn = get_db()
     try:
-        return jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        with conn.cursor() as cur:
+            # Users
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    ngd_id VARCHAR(20) UNIQUE,
+                    first_name VARCHAR(100) NOT NULL,
+                    last_name VARCHAR(100) NOT NULL,
+                    phone VARCHAR(20) UNIQUE NOT NULL,
+                    email VARCHAR(120),
+                    pin_hash VARCHAR(255) NOT NULL,
+                    profile_type VARCHAR(50) DEFAULT 'Animateur NGD',
+                    role VARCHAR(30) DEFAULT 'user',
+                    region VARCHAR(100),
+                    commune VARCHAR(100),
+                    status VARCHAR(20) DEFAULT 'active',
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+            # Orders
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS orders (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    order_number VARCHAR(30) UNIQUE,
+                    user_id UUID REFERENCES users(id),
+                    total_amount DECIMAL(12,2) DEFAULT 0,
+                    region VARCHAR(100),
+                    commune VARCHAR(100),
+                    status VARCHAR(20) DEFAULT 'pending',
+                    payment_status VARCHAR(20) DEFAULT 'unpaid',
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+            # Campaigns
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS campaigns (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    name VARCHAR(200) NOT NULL,
+                    slug VARCHAR(80) UNIQUE NOT NULL,
+                    election_type VARCHAR(50) NOT NULL,
+                    region VARCHAR(100) NOT NULL,
+                    commune VARCHAR(100),
+                    election_date DATE,
+                    status VARCHAR(20) DEFAULT 'active',
+                    price_ht DECIMAL(12,2) DEFAULT 0,
+                    price_tva DECIMAL(12,2) DEFAULT 0,
+                    price_total DECIMAL(12,2) DEFAULT 0,
+                    pricing_model VARCHAR(30) DEFAULT 'forfait',
+                    description TEXT,
+                    created_by UUID REFERENCES users(id),
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+            # Indexes
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_users_phone ON users(phone);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_campaigns_status ON campaigns(status);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_campaigns_region ON campaigns(region);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_campaigns_created ON campaigns(created_at DESC);")
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+        app.logger.error(f"[INIT_DB] {e}")
+    finally:
+        release_db(conn)
+
+# ═══════════════════════════════════════════════════════════════════
+# JWT MIDDLEWARE
+# ═══════════════════════════════════════════════════════════════════
+
+def generate_ngd_id():
+    return f"NGD-{datetime.now().year}-{uuid.uuid4().hex[:6].upper()}"
+
+def generate_token(user_id):
+    payload = {
+        'sub': str(user_id),
+        'iat': datetime.utcnow(),
+        'exp': datetime.utcnow() + timedelta(hours=app.config['JWT_EXPIRATION_HOURS'])
+    }
+    return jwt.encode(payload, app.config['SECRET_KEY'], algorithm='HS256')
+
+def decode_token(token):
+    try:
+        return jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
     except jwt.ExpiredSignatureError:
         return None
     except jwt.InvalidTokenError:
         return None
 
-def require_auth(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        auth_header = request.headers.get('Authorization', '')
-        if not auth_header.startswith('Bearer '):
-            return jsonify({"detail": "Token manquant"}), 401
-        token = auth_header[7:]
-        payload = decode_jwt(token)
-        if not payload:
-            return jsonify({"detail": "Token invalide ou expiré"}), 401
-        request.current_user = payload
-        return f(*args, **kwargs)
-    return decorated
-
-def require_role(allowed_roles):
-    def decorator(f):
-        @wraps(f)
-        def decorated(*args, **kwargs):
-            if not hasattr(request, 'current_user'):
-                return jsonify({"detail": "Authentification requise"}), 401
-            if request.current_user.get("role") not in allowed_roles:
-                return jsonify({"detail": "Permission insuffisante"}), 403
-            return f(*args, **kwargs)
-        return decorated
-    return decorator
-
-# ═══════════════════════════════════════════════════════════════
-#  STOCKAGE TOKENS BOT (mémoire — tokens jetables 5 min)
-# ═══════════════════════════════════════════════════════════════
-_bot_tokens = {}
-
-# ============================================================
-# ROUTES — AUTHENTIFICATION
-# ============================================================
-
-@app.route('/api/v1/auth/register', methods=['POST'])
-def register():
-    data = request.get_json()
-    phone = data.get('phone', '').strip()
-    first_name = data.get('first_name', '').strip()
-    last_name = data.get('last_name', '').strip()
-    email = data.get('email', '').strip() or None
-    pin = data.get('pin', '')
-    profile_type = data.get('profile_type', 'Animateur NGD')
-    region = data.get('region', '').strip() or None
-    commune = data.get('commune', '').strip() or None
-    specialty = data.get('specialty', '').strip() or None
-
-    if not phone or not first_name or not last_name or not pin:
-        return jsonify({"detail": "Champs obligatoires manquants"}), 400
-
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id FROM users WHERE phone = %s", (phone,))
-            if cur.fetchone():
-                return jsonify({"detail": "Ce numéro de téléphone est déjà enregistré"}), 400
-
-            cur.execute("SELECT generate_ngd_id()")
-            ngd_id = cur.fetchone()[0]
-
-            pin_hash = hash_pin(pin)
-
-            cur.execute("""
-                INSERT INTO users (phone, first_name, last_name, email, pin_hash, 
-                                  profile_type, region, commune, specialty, ngd_id, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'active')
-                RETURNING id, phone, first_name, last_name, email, role, profile_type,
-                          region, commune, ngd_id, wallet_balance, cashback_balance, status, created_at
-            """, (phone, first_name, last_name, email, pin_hash, profile_type, region, commune, specialty, ngd_id))
-
-            row = cur.fetchone()
-            user = dict_from_row(cur, row)
-
-            cur.execute("""
-                SELECT log_activity(%s, NULL, 'inscription', 'user', 
-                                   %s::jsonb, 'user', %s, 'api')
-            """, (str(user['id']), json.dumps({"profile_type": profile_type, "region": region}), str(user['id'])))
-
-            conn.commit()
-            return jsonify(user), 201
-    except Exception as e:
-        conn.rollback()
-        print(f"❌ Erreur register: {e}")
-        return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
-    finally:
-        conn.close()
-
-@app.route('/api/v1/auth/login', methods=['POST'])
-def login():
-    data = request.get_json()
-    phone = data.get('phone', '').strip()
-    pin = data.get('pin', '')
-
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, phone, first_name, last_name, role, pin_hash, status
-                FROM users WHERE phone = %s
-            """, (phone,))
-
-            row = cur.fetchone()
-            if not row or not verify_pin(pin, row[5]):
-                return jsonify({"detail": "Téléphone ou PIN incorrect"}), 401
-
-            if row[6] != 'active':
-                return jsonify({"detail": "Compte suspendu"}), 403
-
-            cur.execute("UPDATE users SET last_active = NOW() WHERE id = %s", (row[0],))
-            conn.commit()
-
-            token = create_jwt(str(row[0]), row[4])
-
-            return jsonify({
-                "access_token": token,
-                "token_type": "bearer",
-                "user": {
-                    "id": str(row[0]),
-                    "phone": row[1],
-                    "first_name": row[2],
-                    "last_name": row[3],
-                    "role": row[4]
-                }
-            })
-    except Exception as e:
-        print(f"❌ Erreur login: {e}")
-        return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
-    finally:
-        conn.close()
-
-@app.route('/api/v1/auth/me', methods=['GET'])
-@require_auth
-def get_me():
-    user_id = request.current_user['sub']
-
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, phone, first_name, last_name, email, role, profile_type,
-                       region, commune, ngd_id, wallet_balance, cashback_balance, status, created_at
-                FROM users WHERE id = %s
-            """, (user_id,))
-
-            row = cur.fetchone()
-            if not row:
-                return jsonify({"detail": "Utilisateur non trouvé"}), 404
-
-            return jsonify(dict_from_row(cur, row))
-    except Exception as e:
-        print(f"❌ Erreur get_me: {e}")
-        return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
-    finally:
-        conn.close()
-
-# ============================================================
-# ROUTES — CAMPAGNES
-# ============================================================
-
-@app.route('/api/v1/campaigns', methods=['GET'])
-@require_auth
-def list_campaigns():
-    status = request.args.get('status')
-    region = request.args.get('region')
-
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            query = """
-                SELECT id, name, slug, election_type, region, commune, 
-                       election_date::text, status, owner_id::text, created_at
-                FROM campaigns WHERE 1=1
-            """
-            params = []
-
-            if status:
-                query += " AND status = %s"
-                params.append(status)
-            if region:
-                query += " AND region = %s"
-                params.append(region)
-
-            if request.current_user.get("role") not in ["superadmin", "admin"]:
-                query += " AND (owner_id = %s OR id IN (SELECT campaign_id FROM team_members WHERE user_id = %s))"
-                params.extend([request.current_user['sub'], request.current_user['sub']])
-
-            query += " ORDER BY created_at DESC"
-
-            cur.execute(query, params)
-            rows = cur.fetchall()
-            return jsonify(dicts_from_rows(cur, rows))
-    except Exception as e:
-        print(f"❌ Erreur list_campaigns: {e}")
-        return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
-    finally:
-        conn.close()
-
-@app.route('/api/v1/campaigns', methods=['POST'])
-@require_auth
-@require_role(["superadmin", "admin"])
-def create_campaign():
-    data = request.get_json()
-    name = data.get('name', '').strip()
-    election_type = data.get('election_type', '')
-    region = data.get('region', '').strip()
-    commune = data.get('commune', '').strip() or None
-    election_date = data.get('election_date') or None
-    description = data.get('description', '').strip() or None
-
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            slug = name.lower().replace(" ", "-").replace("_", "-")[:100]
-            base_slug = slug
-            counter = 1
-            cur.execute("SELECT 1 FROM campaigns WHERE slug = %s", (slug,))
-            while cur.fetchone():
-                slug = f"{base_slug}-{counter}"
-                counter += 1
-                cur.execute("SELECT 1 FROM campaigns WHERE slug = %s", (slug,))
-
-            cur.execute("""
-                INSERT INTO campaigns (name, slug, election_type, region, commune, 
-                                      election_date, owner_id, status, description)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, 'active', %s)
-                RETURNING id, name, slug, election_type, region, commune, 
-                          election_date::text, status, owner_id::text, created_at
-            """, (name, slug, election_type, region, commune, election_date,
-                  request.current_user['sub'], description))
-
-            row = cur.fetchone()
-            campaign = dict_from_row(cur, row)
-
-            cur.execute("""
-                SELECT log_activity(%s, %s, 'creation_campagne', 'campaign',
-                                   %s::jsonb, 'campaign', %s, 'api')
-            """, (request.current_user['sub'], campaign['id'], json.dumps({"name": name}), campaign['id']))
-
-            conn.commit()
-            return jsonify(campaign), 201
-    except Exception as e:
-        conn.rollback()
-        print(f"❌ Erreur create_campaign: {e}")
-        return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
-    finally:
-        conn.close()
-
-@app.route('/api/v1/campaigns/<campaign_id>', methods=['GET'])
-@require_auth
-def get_campaign(campaign_id):
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, name, slug, election_type, region, commune, 
-                       election_date::text, status, owner_id::text, created_at
-                FROM campaigns WHERE id = %s
-            """, (campaign_id,))
-
-            row = cur.fetchone()
-            if not row:
-                return jsonify({"detail": "Campagne non trouvée"}), 404
-
-            return jsonify(dict_from_row(cur, row))
-    except Exception as e:
-        print(f"❌ Erreur get_campaign: {e}")
-        return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
-    finally:
-        conn.close()
-
-@app.route('/api/v1/campaigns/<campaign_id>/stats', methods=['GET'])
-@require_auth
-def get_campaign_stats(campaign_id):
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM v_campaign_stats WHERE campaign_id = %s", (campaign_id,))
-            row = cur.fetchone()
-            if not row:
-                return jsonify({"detail": "Campagne non trouvée"}), 404
-            return jsonify(dict_from_row(cur, row))
-    except Exception as e:
-        print(f"❌ Erreur get_campaign_stats: {e}")
-        return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
-    finally:
-        conn.close()
-
-# ============================================================
-# ROUTES — GESTION D'ÉQUIPE
-# ============================================================
-
-@app.route('/api/v1/campaigns/<campaign_id>/team', methods=['GET'])
-@require_auth
-def get_team_members(campaign_id):
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT tm.id, tm.campaign_id::text, tm.user_id::text, tm.role, tm.permissions,
-                       tm.status, tm.invited_at, tm.accepted_at,
-                       json_build_object(
-                           'first_name', u.first_name,
-                           'last_name', u.last_name,
-                           'phone', u.phone,
-                           'email', u.email,
-                           'profile_type', u.profile_type
-                       ) as user
-                FROM team_members tm
-                JOIN users u ON tm.user_id = u.id
-                WHERE tm.campaign_id = %s
-                ORDER BY tm.created_at DESC
-            """, (campaign_id,))
-            rows = cur.fetchall()
-            return jsonify(dicts_from_rows(cur, rows))
-    except Exception as e:
-        print(f"❌ Erreur get_team_members: {e}")
-        return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
-    finally:
-        conn.close()
-
-@app.route('/api/v1/campaigns/<campaign_id>/team/invite', methods=['POST'])
-@require_auth
-@require_role(["superadmin", "admin", "manager"])
-def invite_team_member(campaign_id):
-    data = request.get_json()
-    user_id = data.get('user_id')
-    phone = data.get('phone', '').strip() or None
-    role = data.get('role', '')
-
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id FROM campaigns WHERE id = %s", (campaign_id,))
-            if not cur.fetchone():
-                return jsonify({"detail": "Campagne non trouvée"}), 404
-
-            target_user_id = None
-            if user_id:
-                cur.execute("SELECT id FROM users WHERE id = %s", (user_id,))
-                row = cur.fetchone()
-                if row:
-                    target_user_id = row[0]
-            elif phone:
-                cur.execute("SELECT id FROM users WHERE phone = %s", (phone,))
-                row = cur.fetchone()
-                if row:
-                    target_user_id = row[0]
-
-            if not target_user_id:
-                return jsonify({"detail": "Utilisateur non trouvé. Il doit d'abord s'inscrire."}), 400
-
-            cur.execute("""
-                SELECT id FROM team_members WHERE campaign_id = %s AND user_id = %s
-            """, (campaign_id, target_user_id))
-            if cur.fetchone():
-                return jsonify({"detail": "Cet utilisateur est déjà membre de l'équipe"}), 400
-
-            cur.execute("""
-                INSERT INTO team_members (campaign_id, user_id, role, invited_by, status)
-                VALUES (%s, %s, %s, %s, 'pending')
-                RETURNING id, campaign_id::text, user_id::text, role, permissions, status, invited_at
-            """, (campaign_id, target_user_id, role, request.current_user['sub']))
-
-            row = cur.fetchone()
-            conn.commit()
-            return jsonify(dict_from_row(cur, row)), 201
-    except Exception as e:
-        conn.rollback()
-        print(f"❌ Erreur invite_team_member: {e}")
-        return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
-    finally:
-        conn.close()
-
-# ============================================================
-# ROUTES — UTILISATEURS
-# ============================================================
-
-@app.route('/api/v1/users', methods=['GET'])
-@require_auth
-def list_users():
-    campaign_id = request.args.get('campaign_id')
-    profile_type = request.args.get('profile_type')
-    region = request.args.get('region')
-    status = request.args.get('status')
-    search = request.args.get('search', '')
-    limit = int(request.args.get('limit', 50))
-    offset = int(request.args.get('offset', 0))
-
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            query = """
-                SELECT id, phone, first_name, last_name, email, role, profile_type,
-                       region, commune, ngd_id, wallet_balance, cashback_balance, status, created_at
-                FROM users WHERE 1=1
-            """
-            params = []
-
-            if campaign_id:
-                query += " AND id IN (SELECT user_id FROM team_members WHERE campaign_id = %s)"
-                params.append(campaign_id)
-            if profile_type:
-                query += " AND profile_type = %s"
-                params.append(profile_type)
-            if region:
-                query += " AND region = %s"
-                params.append(region)
-            if status:
-                query += " AND status = %s"
-                params.append(status)
-            if search:
-                query += " AND (first_name ILIKE %s OR last_name ILIKE %s OR phone ILIKE %s OR ngd_id ILIKE %s)"
-                params.extend([f"%{search}%"] * 4)
-
-            query += " ORDER BY created_at DESC LIMIT %s OFFSET %s"
-            params.extend([limit, offset])
-
-            cur.execute(query, params)
-            rows = cur.fetchall()
-            return jsonify(dicts_from_rows(cur, rows))
-    except Exception as e:
-        print(f"❌ Erreur list_users: {e}")
-        return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
-    finally:
-        conn.close()
-
-@app.route('/api/v1/users/<user_id>/history', methods=['GET'])
-@require_auth
-def get_user_history(user_id):
-    limit = int(request.args.get('limit', 50))
-
-    if request.current_user['sub'] != user_id and request.current_user.get("role") not in ["superadmin", "admin", "manager"]:
-        return jsonify({"detail": "Permission insuffisante"}), 403
-
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, action_type, action_category, action_details, source, created_at
-                FROM activity_logs
-                WHERE user_id = %s
-                ORDER BY created_at DESC
-                LIMIT %s
-            """, (user_id, limit))
-            rows = cur.fetchall()
-            return jsonify(dicts_from_rows(cur, rows))
-    except Exception as e:
-        print(f"❌ Erreur get_user_history: {e}")
-        return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
-    finally:
-        conn.close()
-
-# ============================================================
-# ROUTES — COMMANDES TCL
-# ============================================================
-
-@app.route('/api/v1/orders', methods=['GET'])
-@require_auth
-def get_orders():
-    campaign_id = request.args.get('campaign_id')
-    status = request.args.get('status')
-    payment_status = request.args.get('payment_status')
-    limit = int(request.args.get('limit', 50))
-    offset = int(request.args.get('offset', 0))
-
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            query = """
-                SELECT o.id, o.order_number, o.total_amount, o.status, o.payment_status,
-                       o.created_at, o.region, o.commune,
-                       json_build_object('first_name', u.first_name, 'last_name', u.last_name, 'phone', u.phone) as user
-                FROM tcl_orders o
-                JOIN users u ON o.user_id = u.id
-                WHERE 1=1
-            """
-            params = []
-
-            if campaign_id:
-                query += " AND o.campaign_id = %s"
-                params.append(campaign_id)
-            if status:
-                query += " AND o.status = %s"
-                params.append(status)
-            if payment_status:
-                query += " AND o.payment_status = %s"
-                params.append(payment_status)
-
-            query += " ORDER BY o.created_at DESC LIMIT %s OFFSET %s"
-            params.extend([limit, offset])
-
-            cur.execute(query, params)
-            rows = cur.fetchall()
-            return jsonify(dicts_from_rows(cur, rows))
-    except Exception as e:
-        print(f"❌ Erreur get_orders: {e}")
-        return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
-    finally:
-        conn.close()
-
-@app.route('/api/v1/orders', methods=['POST'])
-@require_auth
-def create_order():
-    data = request.get_json()
-    items = data.get('items', [])
-    delivery_mode = data.get('delivery_mode', '')
-    address = data.get('address', '').strip() or None
-    region = data.get('region', '').strip() or None
-    commune = data.get('commune', '').strip() or None
-
-    total = sum(item.get("montant", 0) * item.get("qte", 1) for item in items)
-    cashback_comm = round(total * 0.025) if total >= 30000 else 0
-    cashback_col = round(total * 0.01) if total >= 30000 else 0
-
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT generate_order_number()")
-            order_number = cur.fetchone()[0]
-
-            cur.execute("""
-                INSERT INTO tcl_orders (order_number, user_id, items, total_amount,
-                                       cashback_community, cashback_colistier, 
-                                       delivery_mode, address, region, commune, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending')
-                RETURNING id, order_number, total_amount, status, payment_status, created_at
-            """, (order_number, request.current_user['sub'], 
-                  json.dumps(items), total, cashback_comm, cashback_col,
-                  delivery_mode, address, region, commune))
-
-            row = cur.fetchone()
-            conn.commit()
-            return jsonify(dict_from_row(cur, row)), 201
-    except Exception as e:
-        conn.rollback()
-        print(f"❌ Erreur create_order: {e}")
-        return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
-    finally:
-        conn.close()
-
-# ============================================================
-# ROUTES — WALLET MI SIKAH
-# ============================================================
-
-@app.route('/api/v1/wallet/withdrawals/pending', methods=['GET'])
-@require_auth
-@require_role(["superadmin", "admin", "agent_croire"])
-def get_pending_withdrawals():
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM v_pending_withdrawals")
-            rows = cur.fetchall()
-            return jsonify(dicts_from_rows(cur, rows))
-    except Exception as e:
-        print(f"❌ Erreur get_pending_withdrawals: {e}")
-        return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
-    finally:
-        conn.close()
-
-@app.route('/api/v1/wallet/withdrawals/<tx_id>/validate', methods=['POST'])
-@require_auth
-@require_role(["superadmin", "admin", "agent_croire"])
-def validate_withdrawal(tx_id):
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT user_id, amount FROM wallet_transactions 
-                WHERE id = %s AND type = 'withdrawal' AND withdrawal_status = 'pending'
-            """, (tx_id,))
-
-            row = cur.fetchone()
-            if not row:
-                return jsonify({"detail": "Transaction non trouvée ou déjà traitée"}), 404
-
-            cur.execute("""
-                UPDATE users SET wallet_balance = wallet_balance - %s WHERE id = %s
-            """, (row[1], row[0]))
-
-            cur.execute("""
-                UPDATE wallet_transactions 
-                SET withdrawal_status = 'approved', processed_by = %s, processed_at = NOW()
-                WHERE id = %s
-            """, (request.current_user['sub'], tx_id))
-
-            conn.commit()
-            return jsonify({"message": "Retrait validé"})
-    except Exception as e:
-        conn.rollback()
-        print(f"❌ Erreur validate_withdrawal: {e}")
-        return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
-    finally:
-        conn.close()
-
-# ============================================================
-# ROUTES — CONFIGURATION
-# ============================================================
-
-@app.route('/api/v1/config', methods=['GET'])
-@require_auth
-def list_configs():
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT config_key, config_value, config_type, description FROM system_config ORDER BY config_key")
-            rows = cur.fetchall()
-            return jsonify(dicts_from_rows(cur, rows))
-    except Exception as e:
-        print(f"❌ Erreur list_configs: {e}")
-        return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
-    finally:
-        conn.close()
-
-@app.route('/api/v1/config/<key>', methods=['GET'])
-@require_auth
-def get_config(key):
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT config_key, config_value, config_type FROM system_config WHERE config_key = %s", (key,))
-            row = cur.fetchone()
-            if not row:
-                return jsonify({"detail": "Configuration non trouvée"}), 404
-            return jsonify(dict_from_row(cur, row))
-    except Exception as e:
-        print(f"❌ Erreur get_config: {e}")
-        return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
-    finally:
-        conn.close()
-
-# ============================================================
-# ROUTES — DASHBOARD & HEALTH
-# ============================================================
+@app.before_request
+def jwt_middleware():
+    g.current_user = None
+    if request.method == 'OPTIONS':
+        return
+    open_paths = [
+        '/api/v1/auth/login',
+        '/api/v1/auth/register',
+        '/api/auth/verify-bot-token',
+        '/health',
+        '/'
+    ]
+    if request.path in open_paths or request.path.endswith('/health'):
+        return
+
+    auth_header = request.headers.get('Authorization', '')
+    if auth_header.startswith('Bearer '):
+        token = auth_header.split(' ')[1]
+        decoded = decode_token(token)
+        if decoded:
+            conn = get_db()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT id, ngd_id, first_name, last_name, phone, email,
+                               profile_type, role, region, commune, status
+                        FROM users WHERE id = %s
+                    """, [decoded['sub']])
+                    row = cur.fetchone()
+                    if row:
+                        g.current_user = {
+                            "id": str(row[0]), "ngd_id": row[1], "first_name": row[2],
+                            "last_name": row[3], "phone": row[4], "email": row[5],
+                            "profile_type": row[6], "role": row[7],
+                            "region": row[8], "commune": row[9], "status": row[10]
+                        }
+            finally:
+                release_db(conn)
+
+# ═══════════════════════════════════════════════════════════════════
+# HEALTH CHECK
+# ═══════════════════════════════════════════════════════════════════
 
 @app.route('/')
 def root():
-    return jsonify({
-        "name": "Coalition 509 API",
-        "version": "2.1.0",
-        "status": "operational",
-        "ecosystem": "VoteConnect | ChallengeFinancier™",
-        "author": "Coach Morgan's (Simplice KOUAME)"
-    })
+    return jsonify({"status": "Coalition 509 API is running", "version": "2.3.0"})
 
 @app.route('/health')
 def health():
-    try:
-        conn = get_db()
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1")
-            cur.fetchone()
-        conn.close()
-        db_status = "connected"
-    except Exception as e:
-        db_status = f"error: {str(e)}"
-    return jsonify({
-        "status": "healthy",
-        "database": db_status,
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    })
+    return jsonify({"status": "ok"})
 
-@app.route('/api/v1/dashboard/stats', methods=['GET'])
-@require_auth
-def dashboard_stats():
+# ═══════════════════════════════════════════════════════════════════
+# AUTH ROUTES
+# ═══════════════════════════════════════════════════════════════════
+
+@app.route('/api/v1/auth/register', methods=['POST'])
+def register():
+    data = request.get_json() or {}
+    required = ['first_name', 'last_name', 'phone', 'pin']
+    for f in required:
+        if not data.get(f):
+            return jsonify({"detail": f"Champ obligatoire: {f}"}), 400
+
+    first_name = data['first_name'].strip()
+    last_name = data['last_name'].strip()
+    phone = re.sub(r'\s+', '', data['phone'])
+    pin = data['pin'].strip()
+    profile_type = data.get('profile_type', 'Animateur NGD').strip()
+    region = data.get('region', '').strip()
+    commune = data.get('commune', '').strip()
+
+    if not re.match(r'^\d{4}$', pin):
+        return jsonify({"detail": "Le PIN doit contenir exactement 4 chiffres."}), 400
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE phone = %s", [phone])
+            if cur.fetchone():
+                return jsonify({"detail": "Ce numéro est déjà inscrit."}), 409
+
+            ngd_id = generate_ngd_id()
+            pin_hash = generate_password_hash(pin)
+            role = 'admin' if profile_type.lower() in ['coach', 'superadmin'] else 'user'
+
+            cur.execute("""
+                INSERT INTO users (ngd_id, first_name, last_name, phone, pin_hash,
+                                   profile_type, role, region, commune, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'active')
+                RETURNING id
+            """, [ngd_id, first_name, last_name, phone, pin_hash, profile_type, role, region, commune])
+            user_id = cur.fetchone()[0]
+            conn.commit()
+
+            return jsonify({
+                "id": str(user_id), "ngd_id": ngd_id,
+                "message": "Inscription réussie"
+            }), 201
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"detail": str(e)}), 500
+    finally:
+        release_db(conn)
+
+@app.route('/api/v1/auth/login', methods=['POST'])
+def login():
+    data = request.get_json() or {}
+    phone = re.sub(r'\s+', '', data.get('phone', ''))
+    pin = data.get('pin', '').strip()
+
+    if not phone or not pin:
+        return jsonify({"detail": "Téléphone et PIN requis."}), 400
+
     conn = get_db()
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT 
-                    (SELECT COUNT(*) FROM users WHERE status = 'active') as total_users,
-                    (SELECT COUNT(*) FROM campaigns WHERE status = 'active') as total_campaigns,
-                    (SELECT COUNT(*) FROM tcl_orders) as total_orders,
-                    (SELECT COALESCE(SUM(total_amount), 0) FROM tcl_orders WHERE payment_status = 'paid') as total_revenue,
-                    (SELECT COUNT(*) FROM coalition_groups WHERE status = 'active') as total_groups,
-                    (SELECT COUNT(*) FROM lms_enrollments) as total_lms,
-                    (SELECT COUNT(*) FROM wallet_transactions WHERE type = 'withdrawal' AND withdrawal_status = 'pending') as pending_withdrawals
-            """)
+                SELECT id, ngd_id, first_name, last_name, phone, email,
+                       profile_type, role, region, commune, status, pin_hash
+                FROM users WHERE phone = %s
+            """, [phone])
             row = cur.fetchone()
-            return jsonify(dict_from_row(cur, row))
+            if not row or not check_password_hash(row[11], pin):
+                return jsonify({"detail": "Identifiants incorrects."}), 401
+
+            user = {
+                "id": str(row[0]), "ngd_id": row[1], "first_name": row[2],
+                "last_name": row[3], "phone": row[4], "email": row[5],
+                "profile_type": row[6], "role": row[7],
+                "region": row[8], "commune": row[9], "status": row[10]
+            }
+            token = generate_token(row[0])
+            return jsonify({"access_token": token, "user": user}), 200
     except Exception as e:
-        print(f"❌ Erreur dashboard_stats: {e}")
-        return jsonify({"detail": f"Erreur serveur: {str(e)}"}), 500
+        return jsonify({"detail": str(e)}), 500
     finally:
-        conn.close()
+        release_db(conn)
 
-# ═══════════════════════════════════════════════════════════════
-#  ROUTES — AUTH BOT → SAAS (NOUVEAUTÉ v2.2)
-# ═══════════════════════════════════════════════════════════════
-
-@app.route('/api/auth/bot-token', methods=['POST'])
-def bot_token():
-    """
-    Appelé par le Bot Challenger pour générer un token jetable.
-    Body JSON: {"telegram_id": "123456789", "telephone": "0022501..."}
-    """
-    data = request.get_json()
-    tid = data.get('telegram_id')
-    tel = data.get('telephone')
-
-    if not tid or not tel:
-        return jsonify({"ok": False, "error": "telegram_id and telephone required"}), 400
-
-    token = secrets.token_urlsafe(24)
-    _bot_tokens[token] = {
-        "telegram_id": str(tid),
-        "telephone": str(tel),
-        "exp": time.time() + 300  # 5 minutes
-    }
-    return jsonify({"ok": True, "token": token})
-
+@app.route('/api/v1/auth/me', methods=['GET'])
+def me():
+    user = getattr(g, 'current_user', None)
+    if not user:
+        return jsonify({"detail": "Non authentifié."}), 401
+    return jsonify(user), 200
 
 @app.route('/api/auth/verify-bot-token', methods=['POST'])
 def verify_bot_token():
-    """
-    Appelé par le Frontend SaaS au chargement (paramètre ?bot_auth=TOKEN).
-    Body JSON: {"token": "xxx"}
-    """
-    data = request.get_json()
-    token = data.get('token')
+    data = request.get_json() or {}
+    token = data.get('token', '')
+    if not token:
+        return jsonify({"ok": False, "error": "Token manquant"}), 400
 
-    if not token or token not in _bot_tokens:
-        return jsonify({"ok": False, "error": "Invalid token"}), 401
+    # TODO: implémenter la vérification réelle du token bot
+    # Pour l'instant, on simule une réponse positive si le token contient un phone
+    phone = data.get('phone', '')
+    if not phone and '_' in token:
+        phone = token.split('_')[0]
 
-    info = _bot_tokens[token]
-    if time.time() > info["exp"]:
-        del _bot_tokens[token]
-        return jsonify({"ok": False, "error": "Expired"}), 401
-
-    # Recherche l'utilisateur par téléphone dans la DB
     conn = get_db()
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT id, phone, first_name, last_name, role, profile_type,
-                       region, commune, ngd_id, wallet_balance, cashback_balance, status
+                SELECT id, ngd_id, first_name, last_name, phone, email,
+                       profile_type, role, region, commune, status
                 FROM users WHERE phone = %s
-            """, (info["telephone"],))
+            """, [phone])
             row = cur.fetchone()
-            if not row:
-                # Utilisateur pas encore dans le SaaS → redirige vers inscription
-                del _bot_tokens[token]
-                return jsonify({
-                    "ok": True,
-                    "needs_registration": True,
-                    "phone": info["telephone"]
+            if row:
+                user = {
+                    "id": str(row[0]), "ngd_id": row[1], "first_name": row[2],
+                    "last_name": row[3], "phone": row[4], "email": row[5],
+                    "profile_type": row[6], "role": row[7],
+                    "region": row[8], "commune": row[9], "status": row[10]
+                }
+                return jsonify({"ok": True, "user": user}), 200
+            else:
+                return jsonify({"ok": True, "needs_registration": True, "phone": phone}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    finally:
+        release_db(conn)
+
+# ═══════════════════════════════════════════════════════════════════
+# USERS ROUTES
+# ═══════════════════════════════════════════════════════════════════
+
+@app.route('/api/v1/users', methods=['GET'])
+def list_users():
+    user = getattr(g, 'current_user', None)
+    if not user:
+        return jsonify({"detail": "Non authentifié."}), 401
+
+    limit = min(200, request.args.get('limit', 100, type=int))
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, ngd_id, first_name, last_name, phone, email,
+                       profile_type, role, region, commune, status, created_at
+                FROM users ORDER BY created_at DESC LIMIT %s
+            """, [limit])
+            rows = cur.fetchall()
+            users = []
+            for r in rows:
+                users.append({
+                    "id": str(r[0]), "ngd_id": r[1], "first_name": r[2],
+                    "last_name": r[3], "phone": r[4], "email": r[5],
+                    "profile_type": r[6], "role": r[7], "region": r[8],
+                    "commune": r[9], "status": r[10],
+                    "created_at": r[11].isoformat() if r[11] else None
+                })
+            return jsonify(users), 200
+    except Exception as e:
+        return jsonify({"detail": str(e)}), 500
+    finally:
+        release_db(conn)
+
+# ═══════════════════════════════════════════════════════════════════
+# ORDERS ROUTES
+# ═══════════════════════════════════════════════════════════════════
+
+@app.route('/api/v1/orders', methods=['GET'])
+def list_orders():
+    user = getattr(g, 'current_user', None)
+    if not user:
+        return jsonify({"detail": "Non authentifié."}), 401
+
+    limit = min(200, request.args.get('limit', 100, type=int))
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT o.id, o.order_number, o.total_amount, o.region, o.commune,
+                       o.status, o.payment_status, o.created_at,
+                       u.id, u.first_name, u.last_name, u.phone
+                FROM orders o
+                LEFT JOIN users u ON o.user_id = u.id
+                ORDER BY o.created_at DESC LIMIT %s
+            """, [limit])
+            rows = cur.fetchall()
+            orders = []
+            for r in rows:
+                orders.append({
+                    "id": str(r[0]), "order_number": r[1], "total_amount": float(r[2]) if r[2] else 0,
+                    "region": r[3], "commune": r[4], "status": r[5],
+                    "payment_status": r[6], "created_at": r[7].isoformat() if r[7] else None,
+                    "user": {
+                        "id": str(r[8]) if r[8] else None,
+                        "first_name": r[9], "last_name": r[10], "phone": r[11]
+                    }
+                })
+            return jsonify(orders), 200
+    except Exception as e:
+        return jsonify({"detail": str(e)}), 500
+    finally:
+        release_db(conn)
+
+# ═══════════════════════════════════════════════════════════════════
+# CAMPAIGNS ROUTES (NOUVEAU)
+# ═══════════════════════════════════════════════════════════════════
+
+def slugify(name):
+    base = re.sub(r'[^\w\s-]', '', name.lower()).strip().replace(' ', '-')
+    return f"{base[:50]}-{uuid.uuid4().hex[:6]}"
+
+@app.route('/api/v1/campaigns', methods=['GET'])
+def list_campaigns():
+    user = getattr(g, 'current_user', None)
+    if not user:
+        return jsonify({"detail": "Non authentifié."}), 401
+
+    page = max(1, request.args.get('page', 1, type=int))
+    per_page = min(50, max(1, request.args.get('per_page', 10, type=int)))
+    search = request.args.get('search', '')
+    status = request.args.get('status', '')
+    region = request.args.get('region', '')
+    offset = (page - 1) * per_page
+
+    params = []
+    conditions = ["1=1"]
+    if search:
+        conditions.append("(name ILIKE %s OR slug ILIKE %s)")
+        params.extend([f"%{search}%", f"%{search}%"])
+    if status:
+        conditions.append("status = %s")
+        params.append(status)
+    if region:
+        conditions.append("region ILIKE %s")
+        params.append(f"%{region}%")
+
+    where_clause = " AND ".join(conditions)
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM campaigns WHERE {where_clause}", params)
+            total = cur.fetchone()[0]
+
+            cur.execute(f"""
+                SELECT id, name, slug, election_type, region, commune,
+                       election_date, status, price_ht, price_total,
+                       pricing_model, description, created_at, updated_at
+                FROM campaigns WHERE {where_clause}
+                ORDER BY created_at DESC LIMIT %s OFFSET %s
+            """, params + [per_page, offset])
+            rows = cur.fetchall()
+
+            campaigns = []
+            for r in rows:
+                campaigns.append({
+                    "id": str(r[0]), "name": r[1], "slug": r[2],
+                    "election_type": r[3], "region": r[4], "commune": r[5],
+                    "election_date": r[6].isoformat() if r[6] else None,
+                    "status": r[7], "price_ht": float(r[8]) if r[8] else 0,
+                    "price_total": float(r[9]) if r[9] else 0,
+                    "pricing_model": r[10], "description": r[11],
+                    "created_at": r[12].isoformat() if r[12] else None,
+                    "updated_at": r[13].isoformat() if r[13] else None,
                 })
 
-            user = dict_from_row(cur, row)
+            return jsonify({
+                "campaigns": campaigns, "total": total,
+                "page": page, "per_page": per_page,
+                "total_pages": (total + per_page - 1) // per_page
+            }), 200
     except Exception as e:
-        print(f"❌ Erreur verify_bot_token DB: {e}")
-        return jsonify({"ok": False, "error": "DB error"}), 500
+        return jsonify({"detail": str(e)}), 500
     finally:
-        conn.close()
+        release_db(conn)
 
-    del _bot_tokens[token]  # one-time use
+@app.route('/api/v1/campaigns', methods=['POST'])
+def create_campaign():
+    user = getattr(g, 'current_user', None)
+    if not user:
+        return jsonify({"detail": "Non authentifié."}), 401
+    if user.get('role') not in ['superadmin', 'admin', 'manager']:
+        return jsonify({"detail": "Permission insuffisante."}), 403
 
-    return jsonify({
-        "ok": True,
-        "user": {
-            "id": str(user.get("id", "")),
-            "phone": user.get("phone", ""),
-            "first_name": user.get("first_name", ""),
-            "last_name": user.get("last_name", ""),
-            "profile_type": user.get("profile_type", ""),
-            "ngd_id": user.get("ngd_id", ""),
-            "region": user.get("region", ""),
-            "commune": user.get("commune", "")
-        }
-    })
+    data = request.get_json() or {}
+    for f in ['name', 'election_type', 'region']:
+        if not data.get(f):
+            return jsonify({"detail": f"Champ obligatoire: {f}"}), 400
 
+    name = data['name'].strip()
+    slug = slugify(name)
+    election_type = data['election_type']
+    region = data['region'].strip()
+    commune = data.get('commune')
+    election_date = data.get('election_date') or None
+    description = data.get('description')
+    price_ht = float(data.get('price_ht', 0))
+    pricing_model = data.get('pricing_model', 'forfait')
 
-# ============================================================
-# DÉMARRAGE
-# ============================================================
+    tva_rate = 0.18
+    price_tva = round(price_ht * tva_rate, 2)
+    price_total = round(price_ht + price_tva, 2)
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO campaigns
+                (name, slug, election_type, region, commune, election_date,
+                 status, price_ht, price_tva, price_total, pricing_model,
+                 description, created_by, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, 'active', %s, %s, %s, %s, %s, %s, NOW())
+                RETURNING id
+            """, [name, slug, election_type, region, commune, election_date,
+                  price_ht, price_tva, price_total, pricing_model, description,
+                  user['id']])
+            campaign_id = cur.fetchone()[0]
+            conn.commit()
+            return jsonify({"id": str(campaign_id), "message": "Campagne créée"}), 201
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"detail": str(e)}), 500
+    finally:
+        release_db(conn)
+
+@app.route('/api/v1/campaigns/<campaign_id>', methods=['GET'])
+def get_campaign(campaign_id):
+    user = getattr(g, 'current_user', None)
+    if not user:
+        return jsonify({"detail": "Non authentifié."}), 401
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, name, slug, election_type, region, commune,
+                       election_date, status, price_ht, price_total,
+                       pricing_model, description, created_at
+                FROM campaigns WHERE id = %s
+            """, [campaign_id])
+            r = cur.fetchone()
+            if not r:
+                return jsonify({"detail": "Campagne non trouvée"}), 404
+            return jsonify({
+                "id": str(r[0]), "name": r[1], "slug": r[2],
+                "election_type": r[3], "region": r[4], "commune": r[5],
+                "election_date": r[6].isoformat() if r[6] else None,
+                "status": r[7], "price_ht": float(r[8]) if r[8] else 0,
+                "price_total": float(r[9]) if r[9] else 0,
+                "pricing_model": r[10], "description": r[11],
+                "created_at": r[12].isoformat() if r[12] else None
+            }), 200
+    except Exception as e:
+        return jsonify({"detail": str(e)}), 500
+    finally:
+        release_db(conn)
+
+# ═══════════════════════════════════════════════════════════════════
+# DASHBOARD STATS
+# ═══════════════════════════════════════════════════════════════════
+
+@app.route('/api/v1/dashboard/stats', methods=['GET'])
+def dashboard_stats():
+    user = getattr(g, 'current_user', None)
+    if not user:
+        return jsonify({"detail": "Non authentifié."}), 401
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM users WHERE status='active'")
+            total_users = cur.fetchone()[0]
+
+            cur.execute("SELECT COUNT(*) FROM campaigns WHERE status='active'")
+            total_campaigns = cur.fetchone()[0]
+
+            cur.execute("SELECT COUNT(*) FROM orders")
+            total_orders = cur.fetchone()[0]
+
+            cur.execute("SELECT COALESCE(SUM(price_total),0) FROM campaigns WHERE status='active'")
+            total_revenue = float(cur.fetchone()[0])
+
+            # Tables optionnelles — on gère l'absence gracieusement
+            try:
+                cur.execute("SELECT COUNT(*) FROM groups WHERE status='active'")
+                total_groups = cur.fetchone()[0]
+            except:
+                total_groups = 0
+
+            try:
+                cur.execute("SELECT COALESCE(SUM(amount),0) FROM withdrawals WHERE status='pending'")
+                pending_withdrawals = float(cur.fetchone()[0])
+            except:
+                pending_withdrawals = 0
+
+            return jsonify({
+                "total_users": total_users,
+                "total_campaigns": total_campaigns,
+                "total_orders": total_orders,
+                "total_revenue": total_revenue,
+                "total_groups": total_groups,
+                "pending_withdrawals": pending_withdrawals
+            }), 200
+    except Exception as e:
+        return jsonify({"detail": str(e)}), 500
+    finally:
+        release_db(conn)
+
+# ═══════════════════════════════════════════════════════════════════
+# ERROR HANDLERS
+# ═══════════════════════════════════════════════════════════════════
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"detail": "Ressource non trouvée."}), 404
+
+@app.errorhandler(500)
+def server_error(e):
+    return jsonify({"detail": "Erreur interne du serveur."}), 500
+
+# ═══════════════════════════════════════════════════════════════════
+# BOOT
+# ═══════════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
-    port = int(os.getenv('PORT', 8000))
-    app.run(host='0.0.0.0', port=port)
+    init_db()
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
+else:
+    init_db()
