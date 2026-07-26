@@ -1,6 +1,6 @@
 """
 Coalition 509 SaaS — Backend Flask
-Version: 2.3.4 (Fix route campaigns + tarification + pagination)
+Version: 2.3.5 (Fix DB schema — retire ForeignKey pour compat UUID/INTEGER)
 """
 
 import os
@@ -8,7 +8,6 @@ import re
 import uuid
 import secrets
 from datetime import datetime, timedelta
-from functools import wraps
 
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
@@ -28,7 +27,7 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
 
-# ── MODÈLES ──
+# ── MODÈLES (sans ForeignKey pour éviter conflit UUID/INTEGER) ──
 class User(db.Model):
     __tablename__ = 'users'
     id = db.Column(db.Integer, primary_key=True)
@@ -60,7 +59,7 @@ class Campaign(db.Model):
     price_total = db.Column(db.Numeric(12, 2), default=0)
     pricing_model = db.Column(db.String(20), default='forfait')
     status = db.Column(db.String(20), default='active')
-    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_by = db.Column(db.Integer)  # pas de ForeignKey
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -68,7 +67,7 @@ class Order(db.Model):
     __tablename__ = 'orders'
     id = db.Column(db.Integer, primary_key=True)
     order_number = db.Column(db.String(50), unique=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('users.id'))
+    user_id = db.Column(db.Integer)  # pas de ForeignKey
     total_amount = db.Column(db.Numeric(12, 2), default=0)
     region = db.Column(db.String(100))
     commune = db.Column(db.String(100))
@@ -86,7 +85,7 @@ class Group(db.Model):
 class Withdrawal(db.Model):
     __tablename__ = 'withdrawals'
     id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('users.id'))
+    user_id = db.Column(db.Integer)  # pas de ForeignKey
     amount = db.Column(db.Numeric(12, 2), default=0)
     status = db.Column(db.String(20), default='pending')
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -258,7 +257,7 @@ def get_orders():
     orders = Order.query.order_by(Order.created_at.desc()).limit(limit).all()
     return jsonify([order_to_dict(o) for o in orders])
 
-# ── CAMPAGNES (FIX v2.3.4) ──
+# ── CAMPAGNES ──
 @app.route('/api/v1/campaigns', methods=['GET'])
 @jwt_required()
 def get_campaigns():
@@ -301,7 +300,7 @@ def create_campaign():
         slug = f"{slug}-{secrets.token_hex(2)}"
 
     price_ht = float(data.get('price_ht', 0))
-    tva = 0.18  # TVA 18%
+    tva = 0.18
     price_total = round(price_ht * (1 + tva), 2)
 
     user_id = int(get_jwt_identity())
@@ -326,7 +325,7 @@ def create_campaign():
 # ── HEALTH ──
 @app.route('/')
 def index():
-    return jsonify({'status': 'ok', 'version': '2.3.4', 'service': 'Coalition 509 API'})
+    return jsonify({'status': 'ok', 'version': '2.3.5', 'service': 'Coalition 509 API'})
 
 @app.route('/api/health')
 def health():
