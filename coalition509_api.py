@@ -1,6 +1,6 @@
 """
 Coalition 509 SaaS — Backend Flask
-Version: 2.3.8 (Fix init-db — DROP CASCADE forcé pour nettoyer toutes les tables/vues existantes)
+Version: 2.3.8 (Fix init-db — DROP CASCADE forcé)
 """
 
 import os
@@ -23,7 +23,6 @@ app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:/
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'dev-secret-change-me')
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=7)
-# Force SSL + pool healthy pour Supabase
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     'connect_args': {'sslmode': 'require'},
     'pool_pre_ping': True,
@@ -34,7 +33,7 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
 
-# ── MODÈLES (sans ForeignKey) ──
+# ── MODÈLES ──
 class User(db.Model):
     __tablename__ = 'users'
     id = db.Column(db.Integer, primary_key=True)
@@ -298,7 +297,7 @@ def create_campaign():
     for f in required:
         if not data.get(f):
             return jsonify({'detail': f'Champ obligatoire: {f}'}), 400
-    slug = re.sub(r'[^\w]+', '-', data['name'].lower()).strip('-')
+    slug = re.sub('[^\w]+', '-', data['name'].lower()).strip('-')
     if Campaign.query.filter_by(slug=slug).first():
         slug = f"{slug}-{secrets.token_hex(2)}"
     price_ht = float(data.get('price_ht', 0))
@@ -331,7 +330,7 @@ def update_campaign(campaign_id):
     data = request.get_json() or {}
     if 'name' in data:
         c.name = data['name'].strip()
-        c.slug = re.sub(r'[^\w]+', '-', c.name.lower()).strip('-')
+        c.slug = re.sub('[^\w]+', '-', c.name.lower()).strip('-')
     if 'election_type' in data:
         c.election_type = data['election_type']
     if 'region' in data:
@@ -361,12 +360,10 @@ def delete_campaign(campaign_id):
     db.session.commit()
     return jsonify({'detail': 'Campagne supprimée'}), 200
 
-# ── SEED (données de test) ──
+# ── SEED ──
 @app.route('/api/seed', methods=['POST'])
 def seed():
-    """Injecte des données de test. Appeler une seule fois après init-db."""
     with app.app_context():
-        # Users
         if not User.query.filter_by(phone='50912345678').first():
             u = User(
                 ngd_id=generate_ngd_id(),
@@ -389,7 +386,6 @@ def seed():
             db.session.add(u2)
         db.session.commit()
 
-        # Campaigns
         if not Campaign.query.filter_by(slug='municipales-2025-port-au-prince').first():
             c1 = Campaign(
                 name='Municipales 2025 — Port-au-Prince',
@@ -416,7 +412,6 @@ def seed():
             db.session.add(c2)
         db.session.commit()
 
-        # Orders
         if not Order.query.filter_by(order_number='CMD-001').first():
             o1 = Order(
                 order_number='CMD-001', user_id=1,
@@ -433,7 +428,6 @@ def seed():
             db.session.add(o2)
         db.session.commit()
 
-        # Groups
         if not Group.query.filter_by(name='NGD Port-au-Prince').first():
             db.session.add(Group(name='NGD Port-au-Prince', status='active'))
         if not Group.query.filter_by(name='NGD Cap-Haïtien').first():
@@ -452,22 +446,16 @@ def health():
     return jsonify({'status': 'healthy'})
 
 # ── INIT DB (RESET COMPLET AVEC CASCADE) ──
-# ⚠️ Cette route supprime TOUTES les tables et vues (même celles créées
-# par d'autres processus) et les recrée. À utiliser UNIQUEMENT en dev/test.
 @app.route('/api/init-db', methods=['GET', 'POST'])
 def init_db():
     with app.app_context():
-        # 1. Supprime les vues qui bloquent
-        views = [
-            'v_campaign_stats', 'v_recent_activity', 'v_pending_withdrawals'
-        ]
+        views = ['v_campaign_stats', 'v_recent_activity', 'v_pending_withdrawals']
         for v in views:
             try:
-                db.session.execute(text(f'DROP VIEW IF EXISTS {v} CASCADE'))
+                db.session.execute(text(f"DROP VIEW IF EXISTS {v} CASCADE"))
             except Exception:
                 pass
 
-        # 2. Supprime les tables qui bloquent (même celles hors modèles)
         tables = [
             'team_members', 'tcl_orders', 'wallet_transactions',
             'lms_enrollments', 'coalition_groups', 'activity_logs',
@@ -476,13 +464,11 @@ def init_db():
         ]
         for t in tables:
             try:
-                db.session.execute(text(f'DROP TABLE IF EXISTS {t} CASCADE'))
+                db.session.execute(text(f"DROP TABLE IF EXISTS {t} CASCADE"))
             except Exception:
                 pass
 
         db.session.commit()
-
-        # 3. Recrée les tables du modèle
         db.create_all()
 
     return jsonify({
