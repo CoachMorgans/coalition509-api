@@ -361,7 +361,7 @@ def delete_campaign(campaign_id):
     return jsonify({'detail': 'Campagne supprimée'}), 200
 
 # ── SEED ──
-@app.route('/api/seed', methods=['POST'])
+@app.route('/api/seed', methods=['GET', 'POST'])
 def seed():
     with app.app_context():
         if not User.query.filter_by(phone='50912345678').first():
