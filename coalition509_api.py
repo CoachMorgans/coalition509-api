@@ -1,11 +1,10 @@
 """
 Coalition 509 SaaS - Backend Flask
-Version: 2.3.9 (Clean - no angle brackets, no raw strings)
+Version: 2.4.0 (Fix init-db + route aliases)
 """
 
 import os
 import re
-import uuid
 import secrets
 from datetime import datetime, timedelta
 
@@ -23,7 +22,6 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'dev-secret-change-me')
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=7)
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
-    'connect_args': {'sslmode': 'require'},
     'pool_pre_ping': True,
     'pool_recycle': 300
 }
@@ -32,7 +30,9 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
 
+# ============================================================
 # MODELS
+# ============================================================
 class User(db.Model):
     __tablename__ = 'users'
     id = db.Column(db.Integer, primary_key=True)
@@ -104,7 +104,9 @@ class BotToken(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     expires_at = db.Column(db.DateTime)
 
+# ============================================================
 # HELPERS
+# ============================================================
 def generate_ngd_id():
     return f"NGD-{datetime.now().year}-{secrets.token_hex(4).upper()[:6]}"
 
@@ -118,7 +120,7 @@ def verify_pin(pin, hashed):
 
 def make_slug(name):
     s = name.lower()
-    s = re.sub('[^a-z0-9]+', '-', s)
+    s = re.sub(r'[^a-z0-9]+', '-', s)
     s = s.strip('-')
     return s
 
@@ -155,7 +157,9 @@ def order_to_dict(o):
         'created_at': o.created_at.isoformat() if o.created_at else None
     }
 
+# ============================================================
 # AUTH
+# ============================================================
 @app.route('/api/v1/auth/register', methods=['POST'])
 def register():
     data = request.get_json() or {}
@@ -163,7 +167,7 @@ def register():
     for f in required:
         if not data.get(f):
             return jsonify({'detail': f'Champ obligatoire: {f}'}), 400
-    if not re.match('^[0-9]{4}$', str(data['pin'])):
+    if not re.match(r'^[0-9]{4}$', str(data['pin'])):
         return jsonify({'detail': 'PIN doit etre 4 chiffres'}), 400
     if User.query.filter_by(phone=data['phone'].strip()).first():
         return jsonify({'detail': 'Telephone deja utilise'}), 409
@@ -217,7 +221,9 @@ def verify_bot_token():
         return jsonify({'ok': True, 'user': user_to_dict(user), 'access_token': jwt_token})
     return jsonify({'ok': True, 'needs_registration': True, 'phone': bt.phone})
 
+# ============================================================
 # DASHBOARD STATS
+# ============================================================
 @app.route('/api/v1/dashboard/stats', methods=['GET'])
 @jwt_required()
 def dashboard_stats():
@@ -236,7 +242,15 @@ def dashboard_stats():
         'total_revenue': float(total_revenue)
     })
 
+# Alias sans /v1 pour compatibilité frontend
+@app.route('/api/dashboard/stats', methods=['GET'])
+@jwt_required()
+def dashboard_stats_alias():
+    return dashboard_stats()
+
+# ============================================================
 # USERS
+# ============================================================
 @app.route('/api/v1/users', methods=['GET'])
 @jwt_required()
 def get_users():
@@ -257,7 +271,14 @@ def get_users():
         'total': total, 'page': page, 'per_page': per_page
     })
 
+@app.route('/api/users', methods=['GET'])
+@jwt_required()
+def get_users_alias():
+    return get_users()
+
+# ============================================================
 # ORDERS
+# ============================================================
 @app.route('/api/v1/orders', methods=['GET'])
 @jwt_required()
 def get_orders():
@@ -271,7 +292,14 @@ def get_orders():
         'total': total, 'page': page, 'per_page': per_page
     })
 
+@app.route('/api/orders', methods=['GET'])
+@jwt_required()
+def get_orders_alias():
+    return get_orders()
+
+# ============================================================
 # CAMPAIGNS
+# ============================================================
 @app.route('/api/v1/campaigns', methods=['GET'])
 @jwt_required()
 def get_campaigns():
@@ -293,6 +321,11 @@ def get_campaigns():
         'campaigns': [campaign_to_dict(c) for c in campaigns],
         'total': total, 'page': page, 'per_page': per_page
     })
+
+@app.route('/api/campaigns', methods=['GET'])
+@jwt_required()
+def get_campaigns_alias():
+    return get_campaigns()
 
 @app.route('/api/v1/campaigns', methods=['POST'])
 @jwt_required()
@@ -322,6 +355,11 @@ def create_campaign():
     db.session.commit()
     return jsonify(campaign_to_dict(campaign)), 201
 
+@app.route('/api/campaigns', methods=['POST'])
+@jwt_required()
+def create_campaign_alias():
+    return create_campaign()
+
 @app.route('/api/v1/campaigns/id', methods=['GET'])
 @jwt_required()
 def get_campaign():
@@ -330,6 +368,11 @@ def get_campaign():
         return jsonify({'detail': 'Parametre id manquant'}), 400
     c = Campaign.query.get_or_404(campaign_id)
     return jsonify(campaign_to_dict(c))
+
+@app.route('/api/campaigns/id', methods=['GET'])
+@jwt_required()
+def get_campaign_alias():
+    return get_campaign()
 
 @app.route('/api/v1/campaigns/id', methods=['PUT'])
 @jwt_required()
@@ -363,6 +406,11 @@ def update_campaign():
     db.session.commit()
     return jsonify(campaign_to_dict(c))
 
+@app.route('/api/campaigns/id', methods=['PUT'])
+@jwt_required()
+def update_campaign_alias():
+    return update_campaign()
+
 @app.route('/api/v1/campaigns/id', methods=['DELETE'])
 @jwt_required()
 def delete_campaign():
@@ -374,10 +422,17 @@ def delete_campaign():
     db.session.commit()
     return jsonify({'detail': 'Campagne supprimee'}), 200
 
+@app.route('/api/campaigns/id', methods=['DELETE'])
+@jwt_required()
+def delete_campaign_alias():
+    return delete_campaign()
+
+# ============================================================
 # SEED
+# ============================================================
 @app.route('/api/seed', methods=['GET', 'POST'])
 def seed():
-    with app.app_context():
+    try:
         if not User.query.filter_by(phone='50912345678').first():
             u = User(
                 ngd_id=generate_ngd_id(),
@@ -448,47 +503,38 @@ def seed():
             db.session.add(Group(name='NGD Cap-Haitien', status='active'))
         db.session.commit()
 
-    return jsonify({'status': 'ok', 'message': 'Donnees de test injectees'})
+        return jsonify({'status': 'ok', 'message': 'Donnees de test injectees'})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
+# ============================================================
 # HEALTH
+# ============================================================
 @app.route('/')
 def index():
-    return jsonify({'status': 'ok', 'version': '2.3.9', 'service': 'Coalition 509 API'})
+    return jsonify({'status': 'ok', 'version': '2.4.0', 'service': 'Coalition 509 API'})
 
 @app.route('/api/health')
 def health():
     return jsonify({'status': 'healthy'})
 
-# INIT DB
+# ============================================================
+# INIT DB — VERSION ROBUSTE
+# ============================================================
 @app.route('/api/init-db', methods=['GET', 'POST'])
 def init_db():
-    with app.app_context():
-        views = ['v_campaign_stats', 'v_recent_activity', 'v_pending_withdrawals']
-        for v in views:
-            try:
-                db.session.execute(text(f"DROP VIEW IF EXISTS {v} CASCADE"))
-            except Exception:
-                pass
-
-        tables = [
-            'team_members', 'tcl_orders', 'wallet_transactions',
-            'lms_enrollments', 'coalition_groups', 'activity_logs',
-            'bot_tokens', 'withdrawals', 'groups', 'orders',
-            'campaigns', 'users'
-        ]
-        for t in tables:
-            try:
-                db.session.execute(text(f"DROP TABLE IF EXISTS {t} CASCADE"))
-            except Exception:
-                pass
-
-        db.session.commit()
+    try:
+        # Utilise SQLAlchemy natif (pas de SQL brut) pour éviter les problèmes de transaction
+        db.drop_all()
         db.create_all()
-
-    return jsonify({
-        'status': 'ok',
-        'message': 'Tables et vues supprimees (CASCADE) et recreees. Appelle /api/seed pour injecter les donnees de test.'
-    })
+        return jsonify({
+            'status': 'ok',
+            'message': 'Tables supprimees et recreees. Appelle /api/seed pour injecter les donnees de test.'
+        })
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 if __name__ == '__main__':
     app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
