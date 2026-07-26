@@ -1,6 +1,6 @@
 """
 Coalition 509 SaaS — Backend Flask
-Version: 2.3.6 (Fix boot freeze — retire db.create_all() du démarrage + SSL force)
+Version: 2.3.7 (Fix schema — init-db fait un reset complet drop_all + create_all)
 """
 
 import os
@@ -235,17 +235,36 @@ def dashboard_stats():
 @app.route('/api/v1/users', methods=['GET'])
 @jwt_required()
 def get_users():
-    limit = request.args.get('limit', 100, type=int)
-    users = User.query.order_by(User.created_at.desc()).limit(limit).all()
-    return jsonify([user_to_dict(u) for u in users])
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 10, type=int)
+    search = request.args.get('search', '')
+    q = User.query
+    if search:
+        q = q.filter(db.or_(
+            User.first_name.ilike(f'%{search}%'),
+            User.last_name.ilike(f'%{search}%'),
+            User.phone.ilike(f'%{search}%')
+        ))
+    total = q.count()
+    users = q.order_by(User.created_at.desc()).offset((page - 1) * per_page).limit(per_page).all()
+    return jsonify({
+        'users': [user_to_dict(u) for u in users],
+        'total': total, 'page': page, 'per_page': per_page
+    })
 
 # ── ORDERS ──
 @app.route('/api/v1/orders', methods=['GET'])
 @jwt_required()
 def get_orders():
-    limit = request.args.get('limit', 100, type=int)
-    orders = Order.query.order_by(Order.created_at.desc()).limit(limit).all()
-    return jsonify([order_to_dict(o) for o in orders])
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 10, type=int)
+    q = Order.query
+    total = q.count()
+    orders = q.order_by(Order.created_at.desc()).offset((page - 1) * per_page).limit(per_page).all()
+    return jsonify({
+        'orders': [order_to_dict(o) for o in orders],
+        'total': total, 'page': page, 'per_page': per_page
+    })
 
 # ── CAMPAGNES ──
 @app.route('/api/v1/campaigns', methods=['GET'])
@@ -298,23 +317,151 @@ def create_campaign():
     db.session.commit()
     return jsonify(campaign_to_dict(campaign)), 201
 
+@app.route('/api/v1/campaigns/<int:campaign_id>', methods=['GET'])
+@jwt_required()
+def get_campaign(campaign_id):
+    c = Campaign.query.get_or_404(campaign_id)
+    return jsonify(campaign_to_dict(c))
+
+@app.route('/api/v1/campaigns/<int:campaign_id>', methods=['PUT'])
+@jwt_required()
+def update_campaign(campaign_id):
+    c = Campaign.query.get_or_404(campaign_id)
+    data = request.get_json() or {}
+    if 'name' in data:
+        c.name = data['name'].strip()
+        c.slug = re.sub(r'[^\w]+', '-', c.name.lower()).strip('-')
+    if 'election_type' in data:
+        c.election_type = data['election_type']
+    if 'region' in data:
+        c.region = data['region'].strip()
+    if 'commune' in data:
+        c.commune = data['commune']
+    if 'election_date' in data and data['election_date']:
+        c.election_date = datetime.strptime(data['election_date'], '%Y-%m-%d').date()
+    if 'description' in data:
+        c.description = data['description']
+    if 'price_ht' in data:
+        c.price_ht = float(data['price_ht'])
+        c.price_total = round(c.price_ht * 1.18, 2)
+    if 'pricing_model' in data:
+        c.pricing_model = data['pricing_model']
+    if 'status' in data:
+        c.status = data['status']
+    c.updated_at = datetime.utcnow()
+    db.session.commit()
+    return jsonify(campaign_to_dict(c))
+
+@app.route('/api/v1/campaigns/<int:campaign_id>', methods=['DELETE'])
+@jwt_required()
+def delete_campaign(campaign_id):
+    c = Campaign.query.get_or_404(campaign_id)
+    db.session.delete(c)
+    db.session.commit()
+    return jsonify({'detail': 'Campagne supprimée'}), 200
+
+# ── SEED (données de test) ──
+@app.route('/api/seed', methods=['POST'])
+def seed():
+    """Injecte des données de test. Appeler une seule fois après init-db."""
+    with app.app_context():
+        # Users
+        if not User.query.filter_by(phone='50912345678').first():
+            u = User(
+                ngd_id=generate_ngd_id(),
+                first_name='Jean', last_name='Pierre',
+                phone='50912345678', email='jean@coalition509.ht',
+                pin_hash=hash_pin('1234'),
+                profile_type='Animateur NGD', role='user',
+                region='Ouest', commune='Port-au-Prince', status='active'
+            )
+            db.session.add(u)
+        if not User.query.filter_by(phone='50987654321').first():
+            u2 = User(
+                ngd_id=generate_ngd_id(),
+                first_name='Marie', last_name='Joseph',
+                phone='50987654321', email='marie@coalition509.ht',
+                pin_hash=hash_pin('1234'),
+                profile_type='Superviseur', role='admin',
+                region='Nord', commune='Cap-Haïtien', status='active'
+            )
+            db.session.add(u2)
+        db.session.commit()
+
+        # Campaigns
+        if not Campaign.query.filter_by(slug='municipales-2025-port-au-prince').first():
+            c1 = Campaign(
+                name='Municipales 2025 — Port-au-Prince',
+                slug='municipales-2025-port-au-prince',
+                election_type='Municipales',
+                region='Ouest', commune='Port-au-Prince',
+                election_date=datetime(2025, 12, 15).date(),
+                description='Campagne électorale municipale pour la capitale.',
+                price_ht=5000.00, price_total=5900.00,
+                pricing_model='forfait', status='active', created_by=1
+            )
+            db.session.add(c1)
+        if not Campaign.query.filter_by(slug='senatoriales-2025-nord').first():
+            c2 = Campaign(
+                name='Sénatoriales 2025 — Nord',
+                slug='senatoriales-2025-nord',
+                election_type='Sénatoriales',
+                region='Nord', commune='Cap-Haïtien',
+                election_date=datetime(2025, 11, 30).date(),
+                description='Campagne sénatoriale pour le département du Nord.',
+                price_ht=8000.00, price_total=9440.00,
+                pricing_model='forfait', status='active', created_by=1
+            )
+            db.session.add(c2)
+        db.session.commit()
+
+        # Orders
+        if not Order.query.filter_by(order_number='CMD-001').first():
+            o1 = Order(
+                order_number='CMD-001', user_id=1,
+                total_amount=5900.00, region='Ouest', commune='Port-au-Prince',
+                status='completed', payment_status='paid'
+            )
+            db.session.add(o1)
+        if not Order.query.filter_by(order_number='CMD-002').first():
+            o2 = Order(
+                order_number='CMD-002', user_id=2,
+                total_amount=9440.00, region='Nord', commune='Cap-Haïtien',
+                status='pending', payment_status='pending'
+            )
+            db.session.add(o2)
+        db.session.commit()
+
+        # Groups
+        if not Group.query.filter_by(name='NGD Port-au-Prince').first():
+            db.session.add(Group(name='NGD Port-au-Prince', status='active'))
+        if not Group.query.filter_by(name='NGD Cap-Haïtien').first():
+            db.session.add(Group(name='NGD Cap-Haïtien', status='active'))
+        db.session.commit()
+
+    return jsonify({'status': 'ok', 'message': 'Données de test injectées'})
+
 # ── HEALTH ──
 @app.route('/')
 def index():
-    return jsonify({'status': 'ok', 'version': '2.3.6', 'service': 'Coalition 509 API'})
+    return jsonify({'status': 'ok', 'version': '2.3.7', 'service': 'Coalition 509 API'})
 
 @app.route('/api/health')
 def health():
     return jsonify({'status': 'healthy'})
 
-# PAS de db.create_all() ici — les tables existent déjà sur Supabase
-# Si besoin de créer les tables : appeler /api/init-db une fois
-
-@app.route('/api/init-db')
+# ── INIT DB (RESET COMPLET) ──
+# ⚠️ Cette route supprime TOUTES les tables et les recrée.
+# À utiliser UNIQUEMENT en phase de développement/test.
+@app.route('/api/init-db', methods=['GET', 'POST'])
 def init_db():
     with app.app_context():
+        db.drop_all()
         db.create_all()
-    return jsonify({'status': 'tables checked/created'})
+    return jsonify({
+        'status': 'ok',
+        'message': 'Tables supprimées et recréées. Appelle /api/seed pour injecter les données de test.'
+    })
 
 if __name__ == '__main__':
     app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
