@@ -1,6 +1,6 @@
 """
 Coalition 509 SaaS — Backend Flask
-Version: 2.3.5 (Fix DB schema — retire ForeignKey pour compat UUID/INTEGER)
+Version: 2.3.6 (Fix boot freeze — retire db.create_all() du démarrage + SSL force)
 """
 
 import os
@@ -22,12 +22,18 @@ app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:/
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'dev-secret-change-me')
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=7)
+# Force SSL + pool healthy pour Supabase
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+    'connect_args': {'sslmode': 'require'},
+    'pool_pre_ping': True,
+    'pool_recycle': 300
+}
 
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
 
-# ── MODÈLES (sans ForeignKey pour éviter conflit UUID/INTEGER) ──
+# ── MODÈLES (sans ForeignKey) ──
 class User(db.Model):
     __tablename__ = 'users'
     id = db.Column(db.Integer, primary_key=True)
@@ -59,7 +65,7 @@ class Campaign(db.Model):
     price_total = db.Column(db.Numeric(12, 2), default=0)
     pricing_model = db.Column(db.String(20), default='forfait')
     status = db.Column(db.String(20), default='active')
-    created_by = db.Column(db.Integer)  # pas de ForeignKey
+    created_by = db.Column(db.Integer)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -67,7 +73,7 @@ class Order(db.Model):
     __tablename__ = 'orders'
     id = db.Column(db.Integer, primary_key=True)
     order_number = db.Column(db.String(50), unique=True)
-    user_id = db.Column(db.Integer)  # pas de ForeignKey
+    user_id = db.Column(db.Integer)
     total_amount = db.Column(db.Numeric(12, 2), default=0)
     region = db.Column(db.String(100))
     commune = db.Column(db.String(100))
@@ -85,7 +91,7 @@ class Group(db.Model):
 class Withdrawal(db.Model):
     __tablename__ = 'withdrawals'
     id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer)  # pas de ForeignKey
+    user_id = db.Column(db.Integer)
     amount = db.Column(db.Numeric(12, 2), default=0)
     status = db.Column(db.String(20), default='pending')
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -113,49 +119,34 @@ def verify_pin(pin, hashed):
 
 def campaign_to_dict(c):
     return {
-        'id': c.id,
-        'name': c.name,
-        'slug': c.slug,
-        'election_type': c.election_type,
-        'region': c.region,
-        'commune': c.commune,
+        'id': c.id, 'name': c.name, 'slug': c.slug,
+        'election_type': c.election_type, 'region': c.region, 'commune': c.commune,
         'election_date': c.election_date.isoformat() if c.election_date else None,
         'description': c.description,
         'price_ht': float(c.price_ht) if c.price_ht else 0,
         'price_total': float(c.price_total) if c.price_total else 0,
-        'pricing_model': c.pricing_model,
-        'status': c.status,
-        'created_by': c.created_by,
-        'created_at': c.created_at.isoformat() if c.created_at else None
+        'pricing_model': c.pricing_model, 'status': c.status,
+        'created_by': c.created_by, 'created_at': c.created_at.isoformat() if c.created_at else None
     }
 
 def user_to_dict(u):
     return {
-        'id': u.id,
-        'ngd_id': u.ngd_id,
-        'first_name': u.first_name,
-        'last_name': u.last_name,
-        'phone': u.phone,
-        'email': u.email,
-        'profile_type': u.profile_type,
-        'role': u.role,
-        'region': u.region,
-        'commune': u.commune,
-        'status': u.status,
-        'created_at': u.created_at.isoformat() if u.created_at else None
+        'id': u.id, 'ngd_id': u.ngd_id,
+        'first_name': u.first_name, 'last_name': u.last_name,
+        'phone': u.phone, 'email': u.email,
+        'profile_type': u.profile_type, 'role': u.role,
+        'region': u.region, 'commune': u.commune,
+        'status': u.status, 'created_at': u.created_at.isoformat() if u.created_at else None
     }
 
 def order_to_dict(o):
     user = User.query.get(o.user_id) if o.user_id else None
     return {
-        'id': o.id,
-        'order_number': o.order_number,
+        'id': o.id, 'order_number': o.order_number,
         'user': user_to_dict(user) if user else None,
         'total_amount': float(o.total_amount) if o.total_amount else 0,
-        'region': o.region,
-        'commune': o.commune,
-        'status': o.status,
-        'payment_status': o.payment_status,
+        'region': o.region, 'commune': o.commune,
+        'status': o.status, 'payment_status': o.payment_status,
         'created_at': o.created_at.isoformat() if o.created_at else None
     }
 
@@ -171,7 +162,6 @@ def register():
         return jsonify({'detail': 'PIN doit être 4 chiffres'}), 400
     if User.query.filter_by(phone=data['phone'].strip()).first():
         return jsonify({'detail': 'Téléphone déjà utilisé'}), 409
-
     user = User(
         ngd_id=generate_ngd_id(),
         first_name=data['first_name'].strip(),
@@ -266,7 +256,6 @@ def get_campaigns():
     search = request.args.get('search', '')
     status_filter = request.args.get('status', '')
     region_filter = request.args.get('region', '')
-
     q = Campaign.query
     if search:
         q = q.filter(Campaign.name.ilike(f'%{search}%'))
@@ -274,15 +263,11 @@ def get_campaigns():
         q = q.filter_by(status=status_filter)
     if region_filter:
         q = q.filter(Campaign.region.ilike(f'%{region_filter}%'))
-
     total = q.count()
     campaigns = q.order_by(Campaign.created_at.desc()).offset((page - 1) * per_page).limit(per_page).all()
-
     return jsonify({
         'campaigns': [campaign_to_dict(c) for c in campaigns],
-        'total': total,
-        'page': page,
-        'per_page': per_page
+        'total': total, 'page': page, 'per_page': per_page
     })
 
 @app.route('/api/v1/campaigns', methods=['POST'])
@@ -293,30 +278,21 @@ def create_campaign():
     for f in required:
         if not data.get(f):
             return jsonify({'detail': f'Champ obligatoire: {f}'}), 400
-
     slug = re.sub(r'[^\w]+', '-', data['name'].lower()).strip('-')
-    existing = Campaign.query.filter_by(slug=slug).first()
-    if existing:
+    if Campaign.query.filter_by(slug=slug).first():
         slug = f"{slug}-{secrets.token_hex(2)}"
-
     price_ht = float(data.get('price_ht', 0))
-    tva = 0.18
-    price_total = round(price_ht * (1 + tva), 2)
-
-    user_id = int(get_jwt_identity())
+    price_total = round(price_ht * 1.18, 2)
     campaign = Campaign(
-        name=data['name'].strip(),
-        slug=slug,
+        name=data['name'].strip(), slug=slug,
         election_type=data['election_type'],
         region=data['region'].strip(),
         commune=data.get('commune'),
         election_date=datetime.strptime(data['election_date'], '%Y-%m-%d').date() if data.get('election_date') else None,
         description=data.get('description'),
-        price_ht=price_ht,
-        price_total=price_total,
+        price_ht=price_ht, price_total=price_total,
         pricing_model=data.get('pricing_model', 'forfait'),
-        status='active',
-        created_by=user_id
+        status='active', created_by=int(get_jwt_identity())
     )
     db.session.add(campaign)
     db.session.commit()
@@ -325,15 +301,20 @@ def create_campaign():
 # ── HEALTH ──
 @app.route('/')
 def index():
-    return jsonify({'status': 'ok', 'version': '2.3.5', 'service': 'Coalition 509 API'})
+    return jsonify({'status': 'ok', 'version': '2.3.6', 'service': 'Coalition 509 API'})
 
 @app.route('/api/health')
 def health():
     return jsonify({'status': 'healthy'})
 
-# ── INIT DB ──
-with app.app_context():
-    db.create_all()
+# PAS de db.create_all() ici — les tables existent déjà sur Supabase
+# Si besoin de créer les tables : appeler /api/init-db une fois
+
+@app.route('/api/init-db')
+def init_db():
+    with app.app_context():
+        db.create_all()
+    return jsonify({'status': 'tables checked/created'})
 
 if __name__ == '__main__':
     app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
