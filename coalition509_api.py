@@ -1,6 +1,6 @@
 """
-Coalition 509 SaaS — Backend Flask
-Version: 2.3.8 (Fix init-db — DROP CASCADE forcé)
+Coalition 509 SaaS - Backend Flask
+Version: 2.3.9 (Clean - no angle brackets, no raw strings)
 """
 
 import os
@@ -17,7 +17,6 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from sqlalchemy import text
 import bcrypt
 
-# ── CONFIG ──
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///coalition509.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -33,7 +32,7 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
 
-# ── MODÈLES ──
+# MODELS
 class User(db.Model):
     __tablename__ = 'users'
     id = db.Column(db.Integer, primary_key=True)
@@ -105,7 +104,7 @@ class BotToken(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     expires_at = db.Column(db.DateTime)
 
-# ── HELPERS ──
+# HELPERS
 def generate_ngd_id():
     return f"NGD-{datetime.now().year}-{secrets.token_hex(4).upper()[:6]}"
 
@@ -116,6 +115,12 @@ def verify_pin(pin, hashed):
     if hashed.startswith('$2'):
         return bcrypt.checkpw(pin.encode(), hashed.encode())
     return check_password_hash(hashed, pin)
+
+def make_slug(name):
+    s = name.lower()
+    s = re.sub('[^a-z0-9]+', '-', s)
+    s = s.strip('-')
+    return s
 
 def campaign_to_dict(c):
     return {
@@ -150,7 +155,7 @@ def order_to_dict(o):
         'created_at': o.created_at.isoformat() if o.created_at else None
     }
 
-# ── AUTH ──
+# AUTH
 @app.route('/api/v1/auth/register', methods=['POST'])
 def register():
     data = request.get_json() or {}
@@ -158,10 +163,10 @@ def register():
     for f in required:
         if not data.get(f):
             return jsonify({'detail': f'Champ obligatoire: {f}'}), 400
-    if not re.match(r'^\d{4}$', str(data['pin'])):
-        return jsonify({'detail': 'PIN doit être 4 chiffres'}), 400
+    if not re.match('^[0-9]{4}$', str(data['pin'])):
+        return jsonify({'detail': 'PIN doit etre 4 chiffres'}), 400
     if User.query.filter_by(phone=data['phone'].strip()).first():
-        return jsonify({'detail': 'Téléphone déjà utilisé'}), 409
+        return jsonify({'detail': 'Telephone deja utilise'}), 409
     user = User(
         ngd_id=generate_ngd_id(),
         first_name=data['first_name'].strip(),
@@ -194,7 +199,7 @@ def login():
 def me():
     user = User.query.get(int(get_jwt_identity()))
     if not user:
-        return jsonify({'detail': 'Utilisateur non trouvé'}), 404
+        return jsonify({'detail': 'Utilisateur non trouve'}), 404
     return jsonify(user_to_dict(user))
 
 @app.route('/api/auth/verify-bot-token', methods=['POST'])
@@ -203,7 +208,7 @@ def verify_bot_token():
     token_str = data.get('token', '')
     bt = BotToken.query.filter_by(token=token_str, used=False).first()
     if not bt or (bt.expires_at and bt.expires_at < datetime.utcnow()):
-        return jsonify({'ok': False, 'error': 'Token invalide ou expiré'}), 400
+        return jsonify({'ok': False, 'error': 'Token invalide ou expire'}), 400
     user = User.query.filter_by(phone=bt.phone).first()
     if user:
         bt.used = True
@@ -212,7 +217,7 @@ def verify_bot_token():
         return jsonify({'ok': True, 'user': user_to_dict(user), 'access_token': jwt_token})
     return jsonify({'ok': True, 'needs_registration': True, 'phone': bt.phone})
 
-# ── DASHBOARD STATS ──
+# DASHBOARD STATS
 @app.route('/api/v1/dashboard/stats', methods=['GET'])
 @jwt_required()
 def dashboard_stats():
@@ -231,7 +236,7 @@ def dashboard_stats():
         'total_revenue': float(total_revenue)
     })
 
-# ── USERS ──
+# USERS
 @app.route('/api/v1/users', methods=['GET'])
 @jwt_required()
 def get_users():
@@ -252,7 +257,7 @@ def get_users():
         'total': total, 'page': page, 'per_page': per_page
     })
 
-# ── ORDERS ──
+# ORDERS
 @app.route('/api/v1/orders', methods=['GET'])
 @jwt_required()
 def get_orders():
@@ -266,7 +271,7 @@ def get_orders():
         'total': total, 'page': page, 'per_page': per_page
     })
 
-# ── CAMPAGNES ──
+# CAMPAIGNS
 @app.route('/api/v1/campaigns', methods=['GET'])
 @jwt_required()
 def get_campaigns():
@@ -297,7 +302,7 @@ def create_campaign():
     for f in required:
         if not data.get(f):
             return jsonify({'detail': f'Champ obligatoire: {f}'}), 400
-    slug = re.sub('[^\w]+', '-', data['name'].lower()).strip('-')
+    slug = make_slug(data['name'])
     if Campaign.query.filter_by(slug=slug).first():
         slug = f"{slug}-{secrets.token_hex(2)}"
     price_ht = float(data.get('price_ht', 0))
@@ -317,20 +322,26 @@ def create_campaign():
     db.session.commit()
     return jsonify(campaign_to_dict(campaign)), 201
 
-@app.route('/api/v1/campaigns/<int:campaign_id>', methods=['GET'])
+@app.route('/api/v1/campaigns/id', methods=['GET'])
 @jwt_required()
-def get_campaign(campaign_id):
+def get_campaign():
+    campaign_id = request.args.get('id', type=int)
+    if not campaign_id:
+        return jsonify({'detail': 'Parametre id manquant'}), 400
     c = Campaign.query.get_or_404(campaign_id)
     return jsonify(campaign_to_dict(c))
 
-@app.route('/api/v1/campaigns/<int:campaign_id>', methods=['PUT'])
+@app.route('/api/v1/campaigns/id', methods=['PUT'])
 @jwt_required()
-def update_campaign(campaign_id):
+def update_campaign():
+    campaign_id = request.args.get('id', type=int)
+    if not campaign_id:
+        return jsonify({'detail': 'Parametre id manquant'}), 400
     c = Campaign.query.get_or_404(campaign_id)
     data = request.get_json() or {}
     if 'name' in data:
         c.name = data['name'].strip()
-        c.slug = re.sub('[^\w]+', '-', c.name.lower()).strip('-')
+        c.slug = make_slug(c.name)
     if 'election_type' in data:
         c.election_type = data['election_type']
     if 'region' in data:
@@ -352,15 +363,18 @@ def update_campaign(campaign_id):
     db.session.commit()
     return jsonify(campaign_to_dict(c))
 
-@app.route('/api/v1/campaigns/<int:campaign_id>', methods=['DELETE'])
+@app.route('/api/v1/campaigns/id', methods=['DELETE'])
 @jwt_required()
-def delete_campaign(campaign_id):
+def delete_campaign():
+    campaign_id = request.args.get('id', type=int)
+    if not campaign_id:
+        return jsonify({'detail': 'Parametre id manquant'}), 400
     c = Campaign.query.get_or_404(campaign_id)
     db.session.delete(c)
     db.session.commit()
-    return jsonify({'detail': 'Campagne supprimée'}), 200
+    return jsonify({'detail': 'Campagne supprimee'}), 200
 
-# ── SEED ──
+# SEED
 @app.route('/api/seed', methods=['GET', 'POST'])
 def seed():
     with app.app_context():
@@ -381,31 +395,31 @@ def seed():
                 phone='50987654321', email='marie@coalition509.ht',
                 pin_hash=hash_pin('1234'),
                 profile_type='Superviseur', role='admin',
-                region='Nord', commune='Cap-Haïtien', status='active'
+                region='Nord', commune='Cap-Haitien', status='active'
             )
             db.session.add(u2)
         db.session.commit()
 
         if not Campaign.query.filter_by(slug='municipales-2025-port-au-prince').first():
             c1 = Campaign(
-                name='Municipales 2025 — Port-au-Prince',
+                name='Municipales 2025 - Port-au-Prince',
                 slug='municipales-2025-port-au-prince',
                 election_type='Municipales',
                 region='Ouest', commune='Port-au-Prince',
                 election_date=datetime(2025, 12, 15).date(),
-                description='Campagne électorale municipale pour la capitale.',
+                description='Campagne electorale municipale pour la capitale.',
                 price_ht=5000.00, price_total=5900.00,
                 pricing_model='forfait', status='active', created_by=1
             )
             db.session.add(c1)
         if not Campaign.query.filter_by(slug='senatoriales-2025-nord').first():
             c2 = Campaign(
-                name='Sénatoriales 2025 — Nord',
+                name='Senatoriales 2025 - Nord',
                 slug='senatoriales-2025-nord',
-                election_type='Sénatoriales',
-                region='Nord', commune='Cap-Haïtien',
+                election_type='Senatoriales',
+                region='Nord', commune='Cap-Haitien',
                 election_date=datetime(2025, 11, 30).date(),
-                description='Campagne sénatoriale pour le département du Nord.',
+                description='Campagne senatoriale pour le departement du Nord.',
                 price_ht=8000.00, price_total=9440.00,
                 pricing_model='forfait', status='active', created_by=1
             )
@@ -422,7 +436,7 @@ def seed():
         if not Order.query.filter_by(order_number='CMD-002').first():
             o2 = Order(
                 order_number='CMD-002', user_id=2,
-                total_amount=9440.00, region='Nord', commune='Cap-Haïtien',
+                total_amount=9440.00, region='Nord', commune='Cap-Haitien',
                 status='pending', payment_status='pending'
             )
             db.session.add(o2)
@@ -430,22 +444,22 @@ def seed():
 
         if not Group.query.filter_by(name='NGD Port-au-Prince').first():
             db.session.add(Group(name='NGD Port-au-Prince', status='active'))
-        if not Group.query.filter_by(name='NGD Cap-Haïtien').first():
-            db.session.add(Group(name='NGD Cap-Haïtien', status='active'))
+        if not Group.query.filter_by(name='NGD Cap-Haitien').first():
+            db.session.add(Group(name='NGD Cap-Haitien', status='active'))
         db.session.commit()
 
-    return jsonify({'status': 'ok', 'message': 'Données de test injectées'})
+    return jsonify({'status': 'ok', 'message': 'Donnees de test injectees'})
 
-# ── HEALTH ──
+# HEALTH
 @app.route('/')
 def index():
-    return jsonify({'status': 'ok', 'version': '2.3.8', 'service': 'Coalition 509 API'})
+    return jsonify({'status': 'ok', 'version': '2.3.9', 'service': 'Coalition 509 API'})
 
 @app.route('/api/health')
 def health():
     return jsonify({'status': 'healthy'})
 
-# ── INIT DB (RESET COMPLET AVEC CASCADE) ──
+# INIT DB
 @app.route('/api/init-db', methods=['GET', 'POST'])
 def init_db():
     with app.app_context():
@@ -473,7 +487,7 @@ def init_db():
 
     return jsonify({
         'status': 'ok',
-        'message': 'Tables et vues supprimées (CASCADE) et recréées. Appelle /api/seed pour injecter les données de test.'
+        'message': 'Tables et vues supprimees (CASCADE) et recreees. Appelle /api/seed pour injecter les donnees de test.'
     })
 
 if __name__ == '__main__':
