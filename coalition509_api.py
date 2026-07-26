@@ -1,11 +1,12 @@
 """
 Coalition 509 SaaS - Backend Flask
-Version: 2.4.0 (Fix init-db + route aliases)
+Version: 2.4.1 (Fix db.or_ + N+1 orders + error logging)
 """
 
 import os
 import re
 import secrets
+import traceback
 from datetime import datetime, timedelta
 
 from flask import Flask, request, jsonify
@@ -13,7 +14,7 @@ from flask_sqlalchemy import SQLAlchemy
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
-from sqlalchemy import text
+from sqlalchemy import text, or_, func
 import bcrypt
 
 app = Flask(__name__)
@@ -22,6 +23,7 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'dev-secret-change-me')
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=7)
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+    'connect_args': {'sslmode': 'require'},
     'pool_pre_ping': True,
     'pool_recycle': 300
 }
@@ -130,32 +132,47 @@ def campaign_to_dict(c):
         'election_type': c.election_type, 'region': c.region, 'commune': c.commune,
         'election_date': c.election_date.isoformat() if c.election_date else None,
         'description': c.description,
-        'price_ht': float(c.price_ht) if c.price_ht else 0,
-        'price_total': float(c.price_total) if c.price_total else 0,
+        'price_ht': float(c.price_ht) if c.price_ht is not None else 0,
+        'price_total': float(c.price_total) if c.price_total is not None else 0,
         'pricing_model': c.pricing_model, 'status': c.status,
-        'created_by': c.created_by, 'created_at': c.created_at.isoformat() if c.created_at else None
+        'created_by': c.created_by,
+        'created_at': c.created_at.isoformat() if c.created_at else None
     }
 
 def user_to_dict(u):
+    if u is None:
+        return None
     return {
         'id': u.id, 'ngd_id': u.ngd_id,
         'first_name': u.first_name, 'last_name': u.last_name,
         'phone': u.phone, 'email': u.email,
         'profile_type': u.profile_type, 'role': u.role,
         'region': u.region, 'commune': u.commune,
-        'status': u.status, 'created_at': u.created_at.isoformat() if u.created_at else None
+        'status': u.status,
+        'created_at': u.created_at.isoformat() if u.created_at else None
     }
 
-def order_to_dict(o):
-    user = User.query.get(o.user_id) if o.user_id else None
+def order_to_dict(o, user_cache=None):
+    user = user_cache.get(o.user_id) if user_cache and o.user_id in user_cache else None
+    if user is None and o.user_id:
+        user = User.query.get(o.user_id)
     return {
         'id': o.id, 'order_number': o.order_number,
-        'user': user_to_dict(user) if user else None,
-        'total_amount': float(o.total_amount) if o.total_amount else 0,
+        'user': user_to_dict(user),
+        'total_amount': float(o.total_amount) if o.total_amount is not None else 0,
         'region': o.region, 'commune': o.commune,
         'status': o.status, 'payment_status': o.payment_status,
         'created_at': o.created_at.isoformat() if o.created_at else None
     }
+
+# ============================================================
+# ERROR HANDLER
+# ============================================================
+@app.errorhandler(Exception)
+def handle_exception(e):
+    tb = traceback.format_exc()
+    app.logger.error(f"ERROR: {str(e)}\n{tb}")
+    return jsonify({'status': 'error', 'message': str(e), 'trace': tb}), 500
 
 # ============================================================
 # AUTH
@@ -232,7 +249,7 @@ def dashboard_stats():
     total_orders = Order.query.count()
     total_groups = Group.query.count()
     pending_withdrawals = Withdrawal.query.filter_by(status='pending').count()
-    total_revenue = db.session.query(db.func.sum(Order.total_amount)).filter_by(payment_status='paid').scalar() or 0
+    total_revenue = db.session.query(func.sum(Order.total_amount)).filter_by(payment_status='paid').scalar() or 0
     return jsonify({
         'total_users': total_users,
         'total_campaigns': total_campaigns,
@@ -242,7 +259,6 @@ def dashboard_stats():
         'total_revenue': float(total_revenue)
     })
 
-# Alias sans /v1 pour compatibilité frontend
 @app.route('/api/dashboard/stats', methods=['GET'])
 @jwt_required()
 def dashboard_stats_alias():
@@ -259,7 +275,7 @@ def get_users():
     search = request.args.get('search', '')
     q = User.query
     if search:
-        q = q.filter(db.or_(
+        q = q.filter(or_(
             User.first_name.ilike(f'%{search}%'),
             User.last_name.ilike(f'%{search}%'),
             User.phone.ilike(f'%{search}%')
@@ -284,11 +300,14 @@ def get_users_alias():
 def get_orders():
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', 10, type=int)
-    q = Order.query
+    q = Order.query.order_by(Order.created_at.desc())
     total = q.count()
-    orders = q.order_by(Order.created_at.desc()).offset((page - 1) * per_page).limit(per_page).all()
+    orders = q.offset((page - 1) * per_page).limit(per_page).all()
+    # Preload users to avoid N+1
+    user_ids = [o.user_id for o in orders if o.user_id]
+    users = {u.id: u for u in User.query.filter(User.id.in_(user_ids)).all()} if user_ids else {}
     return jsonify({
-        'orders': [order_to_dict(o) for o in orders],
+        'orders': [order_to_dict(o, user_cache=users) for o in orders],
         'total': total, 'page': page, 'per_page': per_page
     })
 
@@ -506,6 +525,7 @@ def seed():
         return jsonify({'status': 'ok', 'message': 'Donnees de test injectees'})
     except Exception as e:
         db.session.rollback()
+        app.logger.error(f"Seed error: {str(e)}\n{traceback.format_exc()}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 # ============================================================
@@ -513,19 +533,18 @@ def seed():
 # ============================================================
 @app.route('/')
 def index():
-    return jsonify({'status': 'ok', 'version': '2.4.0', 'service': 'Coalition 509 API'})
+    return jsonify({'status': 'ok', 'version': '2.4.1', 'service': 'Coalition 509 API'})
 
 @app.route('/api/health')
 def health():
     return jsonify({'status': 'healthy'})
 
 # ============================================================
-# INIT DB — VERSION ROBUSTE
+# INIT DB
 # ============================================================
 @app.route('/api/init-db', methods=['GET', 'POST'])
 def init_db():
     try:
-        # Utilise SQLAlchemy natif (pas de SQL brut) pour éviter les problèmes de transaction
         db.drop_all()
         db.create_all()
         return jsonify({
@@ -534,6 +553,7 @@ def init_db():
         })
     except Exception as e:
         db.session.rollback()
+        app.logger.error(f"InitDB error: {str(e)}\n{traceback.format_exc()}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 if __name__ == '__main__':
