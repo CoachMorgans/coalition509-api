@@ -1,6 +1,6 @@
 """
 Coalition 509 SaaS — Backend Flask
-Version: 2.3.7 (Fix schema — init-db fait un reset complet drop_all + create_all)
+Version: 2.3.8 (Fix init-db — DROP CASCADE forcé pour nettoyer toutes les tables/vues existantes)
 """
 
 import os
@@ -14,6 +14,7 @@ from flask_sqlalchemy import SQLAlchemy
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
+from sqlalchemy import text
 import bcrypt
 
 # ── CONFIG ──
@@ -444,23 +445,49 @@ def seed():
 # ── HEALTH ──
 @app.route('/')
 def index():
-    return jsonify({'status': 'ok', 'version': '2.3.7', 'service': 'Coalition 509 API'})
+    return jsonify({'status': 'ok', 'version': '2.3.8', 'service': 'Coalition 509 API'})
 
 @app.route('/api/health')
 def health():
     return jsonify({'status': 'healthy'})
 
-# ── INIT DB (RESET COMPLET) ──
-# ⚠️ Cette route supprime TOUTES les tables et les recrée.
-# À utiliser UNIQUEMENT en phase de développement/test.
+# ── INIT DB (RESET COMPLET AVEC CASCADE) ──
+# ⚠️ Cette route supprime TOUTES les tables et vues (même celles créées
+# par d'autres processus) et les recrée. À utiliser UNIQUEMENT en dev/test.
 @app.route('/api/init-db', methods=['GET', 'POST'])
 def init_db():
     with app.app_context():
-        db.drop_all()
+        # 1. Supprime les vues qui bloquent
+        views = [
+            'v_campaign_stats', 'v_recent_activity', 'v_pending_withdrawals'
+        ]
+        for v in views:
+            try:
+                db.session.execute(text(f'DROP VIEW IF EXISTS {v} CASCADE'))
+            except Exception:
+                pass
+
+        # 2. Supprime les tables qui bloquent (même celles hors modèles)
+        tables = [
+            'team_members', 'tcl_orders', 'wallet_transactions',
+            'lms_enrollments', 'coalition_groups', 'activity_logs',
+            'bot_tokens', 'withdrawals', 'groups', 'orders',
+            'campaigns', 'users'
+        ]
+        for t in tables:
+            try:
+                db.session.execute(text(f'DROP TABLE IF EXISTS {t} CASCADE'))
+            except Exception:
+                pass
+
+        db.session.commit()
+
+        # 3. Recrée les tables du modèle
         db.create_all()
+
     return jsonify({
         'status': 'ok',
-        'message': 'Tables supprimées et recréées. Appelle /api/seed pour injecter les données de test.'
+        'message': 'Tables et vues supprimées (CASCADE) et recréées. Appelle /api/seed pour injecter les données de test.'
     })
 
 if __name__ == '__main__':
