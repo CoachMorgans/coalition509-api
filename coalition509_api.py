@@ -1,6 +1,6 @@
 """
 Coalition 509 SaaS - Backend Flask
-Version: 2.4.1 (Fix db.or_ + N+1 orders + error logging)
+Version: 2.4.2 (Bot Challenger integration)
 """
 
 import os
@@ -239,6 +239,31 @@ def verify_bot_token():
     return jsonify({'ok': True, 'needs_registration': True, 'phone': bt.phone})
 
 # ============================================================
+# BOT CHALLENGER — ROUTE DEDIEE
+# ============================================================
+@app.route('/api/bot/generate-token', methods=['POST'])
+def generate_bot_token():
+    bot_key = request.headers.get('X-Bot-Key')
+    if bot_key != os.environ.get('BOT_API_KEY', 'dev-bot-key'):
+        return jsonify({'detail': 'Unauthorized'}), 401
+    data = request.get_json() or {}
+    phone = data.get('phone', '').strip()
+    if not phone:
+        return jsonify({'detail': 'Phone required'}), 400
+    token = secrets.token_urlsafe(32)
+    bt = BotToken(
+        token=token, phone=phone, used=False,
+        expires_at=datetime.utcnow() + timedelta(hours=1)
+    )
+    db.session.add(bt)
+    db.session.commit()
+    return jsonify({
+        'token': token,
+        'expires_at': bt.expires_at.isoformat(),
+        'link': f'https://coachmorgans.github.io/coalition509-frontend/dashboard.html?bot_auth={token}'
+    })
+
+# ============================================================
 # DASHBOARD STATS
 # ============================================================
 @app.route('/api/v1/dashboard/stats', methods=['GET'])
@@ -303,7 +328,6 @@ def get_orders():
     q = Order.query.order_by(Order.created_at.desc())
     total = q.count()
     orders = q.offset((page - 1) * per_page).limit(per_page).all()
-    # Preload users to avoid N+1
     user_ids = [o.user_id for o in orders if o.user_id]
     users = {u.id: u for u in User.query.filter(User.id.in_(user_ids)).all()} if user_ids else {}
     return jsonify({
@@ -533,7 +557,7 @@ def seed():
 # ============================================================
 @app.route('/')
 def index():
-    return jsonify({'status': 'ok', 'version': '2.4.1', 'service': 'Coalition 509 API'})
+    return jsonify({'status': 'ok', 'version': '2.4.2', 'service': 'Coalition 509 API'})
 
 @app.route('/api/health')
 def health():
