@@ -1,6 +1,6 @@
 """
 Coalition 509 SaaS - Backend Flask
-Version: 2.4.2 (Bot Challenger integration)
+Version: 2.5.0 (Bot Stats integration)
 """
 
 import os
@@ -31,6 +31,8 @@ app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
+
+BOT_API_KEY = os.environ.get("BOT_API_KEY", "coalition509-bot-secret-2026")
 
 # ============================================================
 # MODELS
@@ -105,6 +107,17 @@ class BotToken(db.Model):
     used = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     expires_at = db.Column(db.DateTime)
+
+class BotStat(db.Model):
+    __tablename__ = 'bot_stats'
+    id = db.Column(db.Integer, primary_key=True)
+    bot_version = db.Column(db.String(20), default='1.0.0')
+    total_conversations = db.Column(db.Integer, default=0)
+    active_conversations = db.Column(db.Integer, default=0)
+    leads_generated = db.Column(db.Integer, default=0)
+    conversions = db.Column(db.Integer, default=0)
+    messages_sent = db.Column(db.Integer, default=0)
+    recorded_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 # ============================================================
 # HELPERS
@@ -262,6 +275,75 @@ def generate_bot_token():
         'expires_at': bt.expires_at.isoformat(),
         'link': f'https://coachmorgans.github.io/coalition509-frontend/dashboard.html?bot_auth={token}'
     })
+
+# ============================================================
+# BOT STATS — NOUVELLES ROUTES
+# ============================================================
+@app.route('/api/bot/stats', methods=['POST'])
+def receive_bot_stats():
+    """Le bot envoie ses stats ici. Auth via header X-Bot-API-Key."""
+    auth_header = request.headers.get('X-Bot-API-Key', '')
+    if auth_header != BOT_API_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.get_json() or {}
+    stat = BotStat(
+        bot_version=data.get('bot_version', '1.0.0'),
+        total_conversations=data.get('total_conversations', 0),
+        active_conversations=data.get('active_conversations', 0),
+        leads_generated=data.get('leads_generated', 0),
+        conversions=data.get('conversions', 0),
+        messages_sent=data.get('messages_sent', 0),
+        recorded_at=datetime.utcnow()
+    )
+    db.session.add(stat)
+    db.session.commit()
+    return jsonify({"status": "ok", "id": stat.id}), 200
+
+@app.route('/api/bot/stats', methods=['GET'])
+@jwt_required()
+def get_bot_stats():
+    """Dashboard recupere les dernieres stats."""
+    since = datetime.utcnow() - timedelta(hours=24)
+    latest = BotStat.query.filter(BotStat.recorded_at >= since)\
+                          .order_by(BotStat.recorded_at.desc()).first()
+    week_ago = datetime.utcnow() - timedelta(days=7)
+    week_stats = db.session.query(
+        func.sum(BotStat.leads_generated).label('leads'),
+        func.sum(BotStat.conversions).label('conversions'),
+        func.sum(BotStat.messages_sent).label('messages')
+    ).filter(BotStat.recorded_at >= week_ago).first()
+    return jsonify({
+        "latest": {
+            "total_conversations": latest.total_conversations if latest else 0,
+            "active_conversations": latest.active_conversations if latest else 0,
+            "leads_generated": latest.leads_generated if latest else 0,
+            "conversions": latest.conversions if latest else 0,
+            "messages_sent": latest.messages_sent if latest else 0,
+            "recorded_at": latest.recorded_at.isoformat() if latest else None,
+            "bot_version": latest.bot_version if latest else None
+        },
+        "week": {
+            "leads": int(week_stats.leads or 0),
+            "conversions": int(week_stats.conversions or 0),
+            "messages": int(week_stats.messages or 0)
+        }
+    }), 200
+
+@app.route('/api/bot/stats/history', methods=['GET'])
+@jwt_required()
+def get_bot_stats_history():
+    """Historique des stats pour graphique dashboard."""
+    days = int(request.args.get('days', 7))
+    since = datetime.utcnow() - timedelta(days=days)
+    rows = BotStat.query.filter(BotStat.recorded_at >= since)\
+                        .order_by(BotStat.recorded_at.asc()).all()
+    return jsonify([{
+        "date": r.recorded_at.isoformat(),
+        "conversations": r.total_conversations,
+        "leads": r.leads_generated,
+        "conversions": r.conversions,
+        "messages": r.messages_sent
+    } for r in rows]), 200
 
 # ============================================================
 # DASHBOARD STATS
@@ -557,7 +639,7 @@ def seed():
 # ============================================================
 @app.route('/')
 def index():
-    return jsonify({'status': 'ok', 'version': '2.4.2', 'service': 'Coalition 509 API'})
+    return jsonify({'status': 'ok', 'version': '2.5.0', 'service': 'Coalition 509 API'})
 
 @app.route('/api/health')
 def health():
