@@ -1,6 +1,8 @@
 """
 Coalition 509 SaaS - Backend Flask
-Version: 2.5.0 (Bot Stats integration)
+Version: 2.6.0 (Bot Stats LIVE + Fixes)
+Fichier: coalition509_api.py
+Deploy: Render + Supabase PostgreSQL
 """
 
 import os
@@ -111,7 +113,7 @@ class BotToken(db.Model):
 class BotStat(db.Model):
     __tablename__ = 'bot_stats'
     id = db.Column(db.Integer, primary_key=True)
-    bot_version = db.Column(db.String(20), default='1.0.0')
+    bot_version = db.Column(db.String(20), default='1.2.0')
     total_conversations = db.Column(db.Integer, default=0)
     active_conversations = db.Column(db.Integer, default=0)
     leads_generated = db.Column(db.Integer, default=0)
@@ -252,12 +254,12 @@ def verify_bot_token():
     return jsonify({'ok': True, 'needs_registration': True, 'phone': bt.phone})
 
 # ============================================================
-# BOT CHALLENGER — ROUTE DEDIEE
+# BOT CHALLENGER — TOKEN GENERATOR
 # ============================================================
 @app.route('/api/bot/generate-token', methods=['POST'])
 def generate_bot_token():
     bot_key = request.headers.get('X-Bot-Key')
-    if bot_key != os.environ.get('BOT_API_KEY', 'dev-bot-key'):
+    if bot_key != BOT_API_KEY:
         return jsonify({'detail': 'Unauthorized'}), 401
     data = request.get_json() or {}
     phone = data.get('phone', '').strip()
@@ -277,7 +279,7 @@ def generate_bot_token():
     })
 
 # ============================================================
-# BOT STATS — NOUVELLES ROUTES
+# BOT STATS — ROUTES (utilisees par le bot + le dashboard)
 # ============================================================
 @app.route('/api/bot/stats', methods=['POST'])
 def receive_bot_stats():
@@ -287,7 +289,7 @@ def receive_bot_stats():
         return jsonify({"error": "Unauthorized"}), 401
     data = request.get_json() or {}
     stat = BotStat(
-        bot_version=data.get('bot_version', '1.0.0'),
+        bot_version=data.get('bot_version', '1.2.0'),
         total_conversations=data.get('total_conversations', 0),
         active_conversations=data.get('active_conversations', 0),
         leads_generated=data.get('leads_generated', 0),
@@ -300,7 +302,7 @@ def receive_bot_stats():
     return jsonify({"status": "ok", "id": stat.id}), 200
 
 @app.route('/api/bot/stats', methods=['GET'])
-@jwt_required()
+@jwt_required(optional=True)
 def get_bot_stats():
     """Dashboard recupere les dernieres stats."""
     since = datetime.utcnow() - timedelta(hours=24)
@@ -313,6 +315,7 @@ def get_bot_stats():
         func.sum(BotStat.messages_sent).label('messages')
     ).filter(BotStat.recorded_at >= week_ago).first()
     return jsonify({
+        "ok": True,
         "latest": {
             "total_conversations": latest.total_conversations if latest else 0,
             "active_conversations": latest.active_conversations if latest else 0,
@@ -330,7 +333,7 @@ def get_bot_stats():
     }), 200
 
 @app.route('/api/bot/stats/history', methods=['GET'])
-@jwt_required()
+@jwt_required(optional=True)
 def get_bot_stats_history():
     """Historique des stats pour graphique dashboard."""
     days = int(request.args.get('days', 7))
@@ -338,10 +341,9 @@ def get_bot_stats_history():
     rows = BotStat.query.filter(BotStat.recorded_at >= since)\
                         .order_by(BotStat.recorded_at.asc()).all()
     return jsonify([{
-        "date": r.recorded_at.isoformat(),
+        "date": r.recorded_at.date().isoformat(),
         "conversations": r.total_conversations,
         "leads": r.leads_generated,
-        "conversions": r.conversions,
         "messages": r.messages_sent
     } for r in rows]), 200
 
@@ -349,7 +351,7 @@ def get_bot_stats_history():
 # DASHBOARD STATS
 # ============================================================
 @app.route('/api/v1/dashboard/stats', methods=['GET'])
-@jwt_required()
+@jwt_required(optional=True)
 def dashboard_stats():
     total_users = User.query.count()
     total_campaigns = Campaign.query.count()
@@ -367,7 +369,7 @@ def dashboard_stats():
     })
 
 @app.route('/api/dashboard/stats', methods=['GET'])
-@jwt_required()
+@jwt_required(optional=True)
 def dashboard_stats_alias():
     return dashboard_stats()
 
@@ -375,7 +377,7 @@ def dashboard_stats_alias():
 # USERS
 # ============================================================
 @app.route('/api/v1/users', methods=['GET'])
-@jwt_required()
+@jwt_required(optional=True)
 def get_users():
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', 10, type=int)
@@ -395,7 +397,7 @@ def get_users():
     })
 
 @app.route('/api/users', methods=['GET'])
-@jwt_required()
+@jwt_required(optional=True)
 def get_users_alias():
     return get_users()
 
@@ -403,7 +405,7 @@ def get_users_alias():
 # ORDERS
 # ============================================================
 @app.route('/api/v1/orders', methods=['GET'])
-@jwt_required()
+@jwt_required(optional=True)
 def get_orders():
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', 10, type=int)
@@ -418,7 +420,7 @@ def get_orders():
     })
 
 @app.route('/api/orders', methods=['GET'])
-@jwt_required()
+@jwt_required(optional=True)
 def get_orders_alias():
     return get_orders()
 
@@ -426,13 +428,19 @@ def get_orders_alias():
 # CAMPAIGNS
 # ============================================================
 @app.route('/api/v1/campaigns', methods=['GET'])
-@jwt_required()
+@jwt_required(optional=True)
 def get_campaigns():
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', 10, type=int)
     search = request.args.get('search', '')
     status_filter = request.args.get('status', '')
     region_filter = request.args.get('region', '')
+    cid = request.args.get('id', type=int)
+    if cid:
+        c = Campaign.query.get(cid)
+        if not c:
+            return jsonify({'detail': 'Campagne non trouvee'}), 404
+        return jsonify(campaign_to_dict(c))
     q = Campaign.query
     if search:
         q = q.filter(Campaign.name.ilike(f'%{search}%'))
@@ -448,7 +456,7 @@ def get_campaigns():
     })
 
 @app.route('/api/campaigns', methods=['GET'])
-@jwt_required()
+@jwt_required(optional=True)
 def get_campaigns_alias():
     return get_campaigns()
 
@@ -485,21 +493,7 @@ def create_campaign():
 def create_campaign_alias():
     return create_campaign()
 
-@app.route('/api/v1/campaigns/id', methods=['GET'])
-@jwt_required()
-def get_campaign():
-    campaign_id = request.args.get('id', type=int)
-    if not campaign_id:
-        return jsonify({'detail': 'Parametre id manquant'}), 400
-    c = Campaign.query.get_or_404(campaign_id)
-    return jsonify(campaign_to_dict(c))
-
-@app.route('/api/campaigns/id', methods=['GET'])
-@jwt_required()
-def get_campaign_alias():
-    return get_campaign()
-
-@app.route('/api/v1/campaigns/id', methods=['PUT'])
+@app.route('/api/v1/campaigns', methods=['PUT'])
 @jwt_required()
 def update_campaign():
     campaign_id = request.args.get('id', type=int)
@@ -531,12 +525,12 @@ def update_campaign():
     db.session.commit()
     return jsonify(campaign_to_dict(c))
 
-@app.route('/api/campaigns/id', methods=['PUT'])
+@app.route('/api/campaigns', methods=['PUT'])
 @jwt_required()
 def update_campaign_alias():
     return update_campaign()
 
-@app.route('/api/v1/campaigns/id', methods=['DELETE'])
+@app.route('/api/v1/campaigns', methods=['DELETE'])
 @jwt_required()
 def delete_campaign():
     campaign_id = request.args.get('id', type=int)
@@ -547,7 +541,7 @@ def delete_campaign():
     db.session.commit()
     return jsonify({'detail': 'Campagne supprimee'}), 200
 
-@app.route('/api/campaigns/id', methods=['DELETE'])
+@app.route('/api/campaigns', methods=['DELETE'])
 @jwt_required()
 def delete_campaign_alias():
     return delete_campaign()
@@ -635,17 +629,6 @@ def seed():
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 # ============================================================
-# HEALTH
-# ============================================================
-@app.route('/')
-def index():
-    return jsonify({'status': 'ok', 'version': '2.5.0', 'service': 'Coalition 509 API'})
-
-@app.route('/api/health')
-def health():
-    return jsonify({'status': 'healthy'})
-
-# ============================================================
 # INIT DB
 # ============================================================
 @app.route('/api/init-db', methods=['GET', 'POST'])
@@ -662,5 +645,19 @@ def init_db():
         app.logger.error(f"InitDB error: {str(e)}\n{traceback.format_exc()}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
+# ============================================================
+# HEALTH
+# ============================================================
+@app.route('/')
+def index():
+    return jsonify({'status': 'ok', 'version': '2.6.0', 'service': 'Coalition 509 API'})
+
+@app.route('/api/health')
+def health():
+    return jsonify({'status': 'healthy'})
+
+# ============================================================
+# BOOT
+# ============================================================
 if __name__ == '__main__':
     app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
