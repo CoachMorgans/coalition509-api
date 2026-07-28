@@ -1,6 +1,6 @@
 """
 Coalition 509 SaaS - Backend Flask
-Version: 2.6.0 (Bot Stats LIVE + Fixes)
+Version: 2.7.0 (Profil editable + Paiement + Export CSV)
 Fichier: coalition509_api.py
 Deploy: Render + Supabase PostgreSQL
 """
@@ -9,9 +9,11 @@ import os
 import re
 import secrets
 import traceback
+import csv
+import io
 from datetime import datetime, timedelta
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from flask_sqlalchemy import SQLAlchemy
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from flask_cors import CORS
@@ -79,11 +81,13 @@ class Order(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     order_number = db.Column(db.String(50), unique=True)
     user_id = db.Column(db.Integer)
+    campaign_id = db.Column(db.Integer)
     total_amount = db.Column(db.Numeric(12, 2), default=0)
     region = db.Column(db.String(100))
     commune = db.Column(db.String(100))
     status = db.Column(db.String(20), default='pending')
     payment_status = db.Column(db.String(20), default='pending')
+    payment_method = db.Column(db.String(50))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 class Group(db.Model):
@@ -120,6 +124,20 @@ class BotStat(db.Model):
     conversions = db.Column(db.Integer, default=0)
     messages_sent = db.Column(db.Integer, default=0)
     recorded_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class Payment(db.Model):
+    __tablename__ = 'payments'
+    id = db.Column(db.Integer, primary_key=True)
+    order_id = db.Column(db.Integer, db.ForeignKey('orders.id'))
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'))
+    amount = db.Column(db.Numeric(12, 2), default=0)
+    currency = db.Column(db.String(10), default='HTG')
+    payment_method = db.Column(db.String(50))  # moncash, natcash, paypal, stripe
+    transaction_id = db.Column(db.String(255))
+    status = db.Column(db.String(20), default='pending')  # pending, completed, failed
+    phone = db.Column(db.String(20))  # pour MonCash/NatCash
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 # ============================================================
 # HELPERS
@@ -177,6 +195,7 @@ def order_to_dict(o, user_cache=None):
         'total_amount': float(o.total_amount) if o.total_amount is not None else 0,
         'region': o.region, 'commune': o.commune,
         'status': o.status, 'payment_status': o.payment_status,
+        'payment_method': o.payment_method,
         'created_at': o.created_at.isoformat() if o.created_at else None
     }
 
@@ -238,6 +257,47 @@ def me():
         return jsonify({'detail': 'Utilisateur non trouve'}), 404
     return jsonify(user_to_dict(user))
 
+# ============================================================
+# PROFIL EDITABLE (NOUVEAU)
+# ============================================================
+@app.route('/api/v1/auth/me', methods=['PUT'])
+@jwt_required()
+def update_me():
+    """Mise a jour du profil utilisateur connecte."""
+    user = User.query.get(int(get_jwt_identity()))
+    if not user:
+        return jsonify({'detail': 'Utilisateur non trouve'}), 404
+    data = request.get_json() or {}
+
+    if 'first_name' in data:
+        user.first_name = data['first_name'].strip()
+    if 'last_name' in data:
+        user.last_name = data['last_name'].strip()
+    if 'email' in data:
+        email = data['email'].strip()
+        if email and User.query.filter(User.email == email, User.id != user.id).first():
+            return jsonify({'detail': 'Email deja utilise'}), 409
+        user.email = email or None
+    if 'phone' in data:
+        phone = data['phone'].strip().replace(' ', '')
+        if phone and User.query.filter(User.phone == phone, User.id != user.id).first():
+            return jsonify({'detail': 'Telephone deja utilise'}), 409
+        user.phone = phone
+    if 'region' in data:
+        user.region = data['region'].strip()
+    if 'commune' in data:
+        user.commune = data['commune'].strip()
+    if 'profile_type' in data:
+        user.profile_type = data['profile_type']
+    if 'pin' in data:
+        pin = str(data['pin'])
+        if len(pin) == 4 and pin.isdigit():
+            user.pin_hash = hash_pin(pin)
+
+    user.updated_at = datetime.utcnow()
+    db.session.commit()
+    return jsonify(user_to_dict(user))
+
 @app.route('/api/auth/verify-bot-token', methods=['POST'])
 def verify_bot_token():
     data = request.get_json() or {}
@@ -254,7 +314,7 @@ def verify_bot_token():
     return jsonify({'ok': True, 'needs_registration': True, 'phone': bt.phone})
 
 # ============================================================
-# BOT CHALLENGER — TOKEN GENERATOR
+# BOT CHALLENGER
 # ============================================================
 @app.route('/api/bot/generate-token', methods=['POST'])
 def generate_bot_token():
@@ -279,11 +339,10 @@ def generate_bot_token():
     })
 
 # ============================================================
-# BOT STATS — ROUTES (utilisees par le bot + le dashboard)
+# BOT STATS
 # ============================================================
 @app.route('/api/bot/stats', methods=['POST'])
 def receive_bot_stats():
-    """Le bot envoie ses stats ici. Auth via header X-Bot-API-Key."""
     auth_header = request.headers.get('X-Bot-API-Key', '')
     if auth_header != BOT_API_KEY:
         return jsonify({"error": "Unauthorized"}), 401
@@ -304,7 +363,6 @@ def receive_bot_stats():
 @app.route('/api/bot/stats', methods=['GET'])
 @jwt_required(optional=True)
 def get_bot_stats():
-    """Dashboard recupere les dernieres stats."""
     since = datetime.utcnow() - timedelta(hours=24)
     latest = BotStat.query.filter(BotStat.recorded_at >= since)\
                           .order_by(BotStat.recorded_at.desc()).first()
@@ -335,7 +393,6 @@ def get_bot_stats():
 @app.route('/api/bot/stats/history', methods=['GET'])
 @jwt_required(optional=True)
 def get_bot_stats_history():
-    """Historique des stats pour graphique dashboard."""
     days = int(request.args.get('days', 7))
     since = datetime.utcnow() - timedelta(days=days)
     rows = BotStat.query.filter(BotStat.recorded_at >= since)\
@@ -346,6 +403,203 @@ def get_bot_stats_history():
         "leads": r.leads_generated,
         "messages": r.messages_sent
     } for r in rows]), 200
+
+# ============================================================
+# PAIEMENT (NOUVEAU)
+# ============================================================
+@app.route('/api/v1/payments/init', methods=['POST'])
+@jwt_required()
+def init_payment():
+    """Initie un paiement pour une commande."""
+    data = request.get_json() or {}
+    order_id = data.get('order_id')
+    method = data.get('method', 'moncash')  # moncash, natcash, paypal, stripe
+    phone = data.get('phone', '')
+
+    if not order_id:
+        return jsonify({'detail': 'order_id requis'}), 400
+
+    order = Order.query.get(order_id)
+    if not order:
+        return jsonify({'detail': 'Commande non trouvee'}), 404
+
+    user_id = int(get_jwt_identity())
+    if order.user_id != user_id and not User.query.get(user_id).role in ['admin', 'superadmin']:
+        return jsonify({'detail': 'Permission refusee'}), 403
+
+    # Generer un ID de transaction unique
+    tx_id = f"TX-{secrets.token_hex(8).upper()}"
+
+    payment = Payment(
+        order_id=order_id,
+        user_id=user_id,
+        amount=order.total_amount,
+        currency='HTG',
+        payment_method=method,
+        transaction_id=tx_id,
+        status='pending',
+        phone=phone
+    )
+    db.session.add(payment)
+    db.session.commit()
+
+    # Simulation: selon la methode, retourner des instructions
+    instructions = {
+        'moncash': f"Envoyez {float(order.total_amount)} Gdes au numero MonCash officiel de Coalition 509. Reference: {tx_id}",
+        'natcash': f"Envoyez {float(order.total_amount)} Gdes au numero NatCash officiel. Reference: {tx_id}",
+        'paypal': f"Paiement PayPal simule. Reference: {tx_id}",
+        'stripe': f"Paiement Stripe simule. Reference: {tx_id}"
+    }
+
+    return jsonify({
+        'ok': True,
+        'payment_id': payment.id,
+        'transaction_id': tx_id,
+        'amount': float(order.total_amount),
+        'method': method,
+        'instructions': instructions.get(method, 'Paiement en attente'),
+        'status': 'pending'
+    })
+
+@app.route('/api/v1/payments/confirm', methods=['POST'])
+@jwt_required()
+def confirm_payment():
+    """Confirme un paiement (simule la verification)."""
+    data = request.get_json() or {}
+    payment_id = data.get('payment_id')
+    tx_id = data.get('transaction_id')
+
+    payment = Payment.query.filter(
+        (Payment.id == payment_id) | (Payment.transaction_id == tx_id)
+    ).first()
+
+    if not payment:
+        return jsonify({'detail': 'Paiement non trouve'}), 404
+
+    # Simulation: marquer comme paye
+    payment.status = 'completed'
+    payment.updated_at = datetime.utcnow()
+
+    # Mettre a jour la commande
+    order = Order.query.get(payment.order_id)
+    if order:
+        order.payment_status = 'paid'
+        order.status = 'completed'
+        order.payment_method = payment.payment_method
+
+    db.session.commit()
+    return jsonify({
+        'ok': True,
+        'message': 'Paiement confirme',
+        'payment': {
+            'id': payment.id,
+            'transaction_id': payment.transaction_id,
+            'status': payment.status,
+            'amount': float(payment.amount)
+        }
+    })
+
+@app.route('/api/v1/payments', methods=['GET'])
+@jwt_required()
+def get_payments():
+    """Liste les paiements de l'utilisateur."""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    q = Payment.query
+    if user.role not in ['admin', 'superadmin']:
+        q = q.filter_by(user_id=user_id)
+    payments = q.order_by(Payment.created_at.desc()).all()
+    return jsonify([{
+        'id': p.id,
+        'order_id': p.order_id,
+        'amount': float(p.amount),
+        'currency': p.currency,
+        'method': p.payment_method,
+        'status': p.status,
+        'transaction_id': p.transaction_id,
+        'created_at': p.created_at.isoformat() if p.created_at else None
+    } for p in payments])
+
+# ============================================================
+# EXPORT CSV (NOUVEAU)
+# ============================================================
+@app.route('/api/v1/export/campaigns', methods=['GET'])
+@jwt_required()
+def export_campaigns_csv():
+    """Exporte les campagnes en CSV."""
+    campaigns = Campaign.query.order_by(Campaign.created_at.desc()).all()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['ID', 'Nom', 'Slug', 'Type', 'Region', 'Commune', 'Date election',
+                     'Prix HT', 'Prix Total', 'Modele', 'Statut', 'Cree le'])
+    for c in campaigns:
+        writer.writerow([
+            c.id, c.name, c.slug, c.election_type, c.region, c.commune or '',
+            c.election_date.isoformat() if c.election_date else '',
+            float(c.price_ht) if c.price_ht else 0,
+            float(c.price_total) if c.price_total else 0,
+            c.pricing_model, c.status,
+            c.created_at.isoformat() if c.created_at else ''
+        ])
+    output.seek(0)
+    return Response(
+        output.getvalue(),
+        mimetype='text/csv',
+        headers={'Content-Disposition': 'attachment; filename=campaigns.csv'}
+    )
+
+@app.route('/api/v1/export/orders', methods=['GET'])
+@jwt_required()
+def export_orders_csv():
+    """Exporte les commandes en CSV."""
+    orders = Order.query.order_by(Order.created_at.desc()).all()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['ID', 'Numero', 'Utilisateur', 'Montant', 'Region', 'Commune',
+                     'Statut', 'Paiement', 'Methode', 'Cree le'])
+    for o in orders:
+        user = User.query.get(o.user_id) if o.user_id else None
+        writer.writerow([
+            o.id, o.order_number or '',
+            f"{user.first_name} {user.last_name}" if user else '',
+            float(o.total_amount) if o.total_amount else 0,
+            o.region or '', o.commune or '',
+            o.status, o.payment_status, o.payment_method or '',
+            o.created_at.isoformat() if o.created_at else ''
+        ])
+    output.seek(0)
+    return Response(
+        output.getvalue(),
+        mimetype='text/csv',
+        headers={'Content-Disposition': 'attachment; filename=orders.csv'}
+    )
+
+@app.route('/api/v1/export/users', methods=['GET'])
+@jwt_required()
+def export_users_csv():
+    """Exporte les utilisateurs en CSV (admin uniquement)."""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if user.role not in ['admin', 'superadmin']:
+        return jsonify({'detail': 'Permission refusee'}), 403
+    users = User.query.order_by(User.created_at.desc()).all()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['ID', 'NGD ID', 'Prenom', 'Nom', 'Telephone', 'Email',
+                     'Profil', 'Role', 'Region', 'Commune', 'Statut', 'Cree le'])
+    for u in users:
+        writer.writerow([
+            u.id, u.ngd_id, u.first_name, u.last_name, u.phone,
+            u.email or '', u.profile_type, u.role,
+            u.region or '', u.commune or '', u.status,
+            u.created_at.isoformat() if u.created_at else ''
+        ])
+    output.seek(0)
+    return Response(
+        output.getvalue(),
+        mimetype='text/csv',
+        headers={'Content-Disposition': 'attachment; filename=users.csv'}
+    )
 
 # ============================================================
 # DASHBOARD STATS
@@ -650,7 +904,7 @@ def init_db():
 # ============================================================
 @app.route('/')
 def index():
-    return jsonify({'status': 'ok', 'version': '2.6.0', 'service': 'Coalition 509 API'})
+    return jsonify({'status': 'ok', 'version': '2.7.0', 'service': 'Coalition 509 API'})
 
 @app.route('/api/health')
 def health():
