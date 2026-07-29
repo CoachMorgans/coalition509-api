@@ -1,6 +1,6 @@
 """
-Coalition 509 API — Backend v2.7.3
-Tous les blueprints enregistres, init-db fonctionnel, routes sans chevrons.
+Coalition 509 API — Backend v2.7.4
+Fix init-db : DROP SCHEMA CASCADE pour PostgreSQL.
 """
 
 import os
@@ -22,7 +22,7 @@ app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'coalition509-dev-secret
 db = SQLAlchemy(app)
 CORS(app)
 
-# ─── MODÈLES (définis AVANT les blueprints pour que db.create_all() les voie) ─
+# ─── MODÈLES ───────────────────────────────────────────────────────
 
 class User(db.Model):
     __tablename__ = 'users'
@@ -139,16 +139,10 @@ def login():
         'status': 'success',
         'token': user.phone,
         'user': {
-            'id': user.id,
-            'phone': user.phone,
-            'first_name': user.first_name,
-            'last_name': user.last_name,
-            'email': user.email,
-            'role': user.role,
-            'region': user.region,
-            'commune': user.commune,
-            'profile_type': user.profile_type,
-            'ngd_id': user.ngd_id
+            'id': user.id, 'phone': user.phone, 'first_name': user.first_name,
+            'last_name': user.last_name, 'email': user.email, 'role': user.role,
+            'region': user.region, 'commune': user.commune,
+            'profile_type': user.profile_type, 'ngd_id': user.ngd_id
         }
     })
 
@@ -429,17 +423,21 @@ def bot_stats_post():
     db.session.commit()
     return jsonify({'status': 'success'})
 
-# ─── BLUEPRINT : INIT-DB ───────────────────────────────────────────
+# ─── BLUEPRINT : INIT-DB (FIX CASCADE) ─────────────────────────────
 
 init_bp = Blueprint('init', __name__, url_prefix='/api')
 
 @init_bp.route('/init-db', methods=['GET'])
 def init_db():
     try:
-        db.drop_all()
+        # PostgreSQL CASCADE : drop schema complet puis recreer
+        db.session.execute(db.text("DROP SCHEMA IF EXISTS public CASCADE"))
+        db.session.execute(db.text("CREATE SCHEMA public"))
+        db.session.commit()
         db.create_all()
-        return jsonify({'status': 'success', 'message': 'Base de donnees initialisee'})
+        return jsonify({'status': 'success', 'message': 'Base de donnees reinitialisee (CASCADE)'})
     except Exception as e:
+        db.session.rollback()
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 # ─── BLUEPRINT : SEED ──────────────────────────────────────────────
@@ -537,7 +535,7 @@ app.register_blueprint(seed_bp)
 def index():
     return jsonify({
         'service': 'Coalition 509 API',
-        'version': '2.7.3',
+        'version': '2.7.4',
         'status': 'ok'
     })
 
