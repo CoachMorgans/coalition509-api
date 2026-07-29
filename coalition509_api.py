@@ -1,6 +1,6 @@
 """
 Coalition 509 API — Backend v2.7.3
-Tous les blueprints enregistrés, init-db fonctionnel, routes sans chevrons.
+Tous les blueprints enregistres, init-db fonctionnel, routes sans chevrons.
 """
 
 import os
@@ -32,7 +32,7 @@ class User(db.Model):
     first_name = db.Column(db.String(100))
     last_name = db.Column(db.String(100))
     email = db.Column(db.String(120))
-    role = db.Column(db.String(20), default='user')  # user, admin
+    role = db.Column(db.String(20), default='user')
     status = db.Column(db.String(20), default='active')
     region = db.Column(db.String(50))
     commune = db.Column(db.String(50))
@@ -71,7 +71,7 @@ class BotMessage(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     phone = db.Column(db.String(20))
     message = db.Column(db.Text)
-    direction = db.Column(db.String(10))  # in, out
+    direction = db.Column(db.String(10))
     created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
 
 class BotStat(db.Model):
@@ -103,7 +103,6 @@ def token_required(f):
                 token = parts[1]
         if not token:
             return jsonify({'status': 'error', 'message': 'Token manquant'}), 401
-        # Vérification simple : token = phone_hash
         user = User.query.filter_by(phone=token).first()
         if not user:
             return jsonify({'status': 'error', 'message': 'Token invalide'}), 401
@@ -389,7 +388,6 @@ bot_bp = Blueprint('bot', __name__, url_prefix='/api/bot')
 @bot_bp.route('/stats', methods=['GET'])
 @token_required
 def bot_stats():
-    # Messages des 7 derniers jours
     since = datetime.datetime.utcnow() - datetime.timedelta(days=7)
     msgs = BotMessage.query.filter(BotMessage.created_at >= since).all()
     by_day = {}
@@ -401,7 +399,6 @@ def bot_stats():
             by_day[day]['sent'] += 1
         else:
             by_day[day]['received'] += 1
-    # Trier par date
     days = sorted(by_day.keys())
     chart_data = [{'date': d, 'sent': by_day[d]['sent'], 'received': by_day[d]['received']} for d in days]
     total_sent = sum(d['sent'] for d in chart_data)
@@ -419,12 +416,10 @@ def bot_stats():
 
 @bot_bp.route('/stats', methods=['POST'])
 def bot_stats_post():
-    """Endpoint pour que le bot envoie ses stats."""
     data = request.get_json() or {}
     api_key = request.headers.get('X-Bot-API-Key', '')
     if api_key != os.environ.get('BOT_API_KEY', 'coalition509-bot-secret-2026'):
         return jsonify({'status': 'error', 'message': 'Unauthorized'}), 401
-    # Enregistrer un message
     msg = BotMessage(
         phone=data.get('phone', ''),
         message=data.get('message', ''),
@@ -454,7 +449,6 @@ seed_bp = Blueprint('seed', __name__, url_prefix='/api')
 @seed_bp.route('/seed', methods=['GET', 'POST'])
 def seed():
     try:
-        # Vider les tables
         db.session.query(BotMessage).delete()
         db.session.query(BotStat).delete()
         db.session.query(Order).delete()
@@ -462,7 +456,6 @@ def seed():
         db.session.query(User).delete()
         db.session.commit()
 
-        # Users
         u1 = User(
             phone='50912345678', pin_hash=hash_pin('1234'),
             first_name='Jean', last_name='Pierre', email='jean@coalition509.ht',
@@ -478,7 +471,6 @@ def seed():
         db.session.add_all([u1, u2])
         db.session.commit()
 
-        # Campaigns
         c1 = Campaign(
             name='Campagne Senatoriale Nord',
             description='Campagne senatoriale pour le departement du Nord.',
@@ -496,7 +488,6 @@ def seed():
         db.session.add_all([c1, c2])
         db.session.commit()
 
-        # Orders
         o1 = Order(
             order_number='CMD-001', user_id=u1.id, campaign_id=c2.id,
             total_amount=5900, status='completed', payment_status='paid',
@@ -510,14 +501,12 @@ def seed():
         db.session.add_all([o1, o2])
         db.session.commit()
 
-        # Bot stats demo
         for i in range(7):
             d = datetime.date.today() - datetime.timedelta(days=i)
             bs = BotStat(date=d, messages_sent=10+i, messages_received=5+i, unique_users=3)
             db.session.add(bs)
         db.session.commit()
 
-        # Bot messages demo
         for i in range(3):
             m = BotMessage(
                 phone='50912345678', message=f'Message test {i+1}',
@@ -532,7 +521,6 @@ def seed():
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 # ─── ENREGISTREMENT DES BLUEPRINTS ─────────────────────────────────
-# C'EST ICI QUE CA PLANTAIT — les blueprints auth, stats, bot n'etaient pas enregistres
 
 app.register_blueprint(auth_bp)
 app.register_blueprint(users_bp)
