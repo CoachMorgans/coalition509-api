@@ -1,18 +1,11 @@
 """
 Coalition 509 SaaS - Backend Flask
-Version: 2.7.1 (Fix Stats + Paiement + Export CSV)
+Version: 2.7.2 (Fix Orders filtre user + Bot stats latest + Dashboard robuste)
 Fichier: coalition509_api.py
-Deploy: Render + Supabase PostgreSQL
 """
 
-import os
-import re
-import secrets
-import traceback
-import csv
-import io
+import os, re, secrets, traceback, csv, io
 from datetime import datetime, timedelta
-
 from flask import Flask, request, jsonify, Response
 from flask_sqlalchemy import SQLAlchemy
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
@@ -31,11 +24,9 @@ app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     'pool_pre_ping': True,
     'pool_recycle': 300
 }
-
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
-
 BOT_API_KEY = os.environ.get("BOT_API_KEY", "coalition509-bot-secret-2026")
 
 # ============================================================
@@ -156,8 +147,7 @@ def verify_pin(pin, hashed):
 def make_slug(name):
     s = name.lower()
     s = re.sub(r'[^a-z0-9]+', '-', s)
-    s = s.strip('-')
-    return s
+    return s.strip('-')
 
 def campaign_to_dict(c):
     return {
@@ -173,8 +163,7 @@ def campaign_to_dict(c):
     }
 
 def user_to_dict(u):
-    if u is None:
-        return None
+    if u is None: return None
     return {
         'id': u.id, 'ngd_id': u.ngd_id,
         'first_name': u.first_name, 'last_name': u.last_name,
@@ -308,7 +297,7 @@ def verify_bot_token():
     return jsonify({'ok': True, 'needs_registration': True, 'phone': bt.phone})
 
 # ============================================================
-# BOT CHALLENGER
+# BOT
 # ============================================================
 @app.route('/api/bot/generate-token', methods=['POST'])
 def generate_bot_token():
@@ -320,10 +309,8 @@ def generate_bot_token():
     if not phone:
         return jsonify({'detail': 'Phone required'}), 400
     token = secrets.token_urlsafe(32)
-    bt = BotToken(
-        token=token, phone=phone, used=False,
-        expires_at=datetime.utcnow() + timedelta(hours=1)
-    )
+    bt = BotToken(token=token, phone=phone, used=False,
+                  expires_at=datetime.utcnow() + timedelta(hours=1))
     db.session.add(bt)
     db.session.commit()
     return jsonify({
@@ -332,9 +319,6 @@ def generate_bot_token():
         'link': f'https://coachmorgans.github.io/coalition509-frontend/dashboard.html?bot_auth={token}'
     })
 
-# ============================================================
-# BOT STATS
-# ============================================================
 @app.route('/api/bot/stats', methods=['POST'])
 def receive_bot_stats():
     auth_header = request.headers.get('X-Bot-API-Key', '')
@@ -357,9 +341,8 @@ def receive_bot_stats():
 @app.route('/api/bot/stats', methods=['GET'])
 @jwt_required(optional=True)
 def get_bot_stats():
-    since = datetime.utcnow() - timedelta(hours=24)
-    latest = BotStat.query.filter(BotStat.recorded_at >= since)\
-                          .order_by(BotStat.recorded_at.desc()).first()
+    # Derniere stat SANS limite 24h (evite les 0 si pas de stats aujourd'hui)
+    latest = BotStat.query.order_by(BotStat.recorded_at.desc()).first()
     week_ago = datetime.utcnow() - timedelta(days=7)
     week_stats = db.session.query(
         func.sum(BotStat.leads_generated).label('leads'),
@@ -502,9 +485,8 @@ def export_campaigns_csv():
             c.created_at.isoformat() if c.created_at else ''
         ])
     output.seek(0)
-    return Response(
-        output.getvalue(), mimetype='text/csv',
-        headers={'Content-Disposition': 'attachment; filename=campaigns.csv'}    )
+    return Response(output.getvalue(), mimetype='text/csv',
+                    headers={'Content-Disposition': 'attachment; filename=campaigns.csv'})
 
 @app.route('/api/v1/export/orders', methods=['GET'])
 @jwt_required()
@@ -525,9 +507,8 @@ def export_orders_csv():
             o.created_at.isoformat() if o.created_at else ''
         ])
     output.seek(0)
-    return Response(
-        output.getvalue(), mimetype='text/csv',
-        headers={'Content-Disposition': 'attachment; filename=orders.csv'}    )
+    return Response(output.getvalue(), mimetype='text/csv',
+                    headers={'Content-Disposition': 'attachment; filename=orders.csv'})
 
 @app.route('/api/v1/export/users', methods=['GET'])
 @jwt_required()
@@ -549,12 +530,11 @@ def export_users_csv():
             u.created_at.isoformat() if u.created_at else ''
         ])
     output.seek(0)
-    return Response(
-        output.getvalue(), mimetype='text/csv',
-        headers={'Content-Disposition': 'attachment; filename=users.csv'}    )
+    return Response(output.getvalue(), mimetype='text/csv',
+                    headers={'Content-Disposition': 'attachment; filename=users.csv'})
 
 # ============================================================
-# DASHBOARD STATS (ROBUSTE)
+# DASHBOARD STATS
 # ============================================================
 @app.route('/api/v1/dashboard/stats', methods=['GET'])
 @jwt_required(optional=True)
@@ -566,10 +546,7 @@ def dashboard_stats():
         total_groups = Group.query.count()
         pending_withdrawals = Withdrawal.query.filter_by(status='pending').count()
         total_revenue = db.session.query(func.sum(Order.total_amount)).filter_by(payment_status='paid').scalar()
-        if total_revenue is None:
-            total_revenue = 0.0
-        else:
-            total_revenue = float(total_revenue)
+        total_revenue = float(total_revenue) if total_revenue is not None else 0.0
         return jsonify({
             'total_users': total_users,
             'total_campaigns': total_campaigns,
@@ -580,7 +557,10 @@ def dashboard_stats():
         })
     except Exception as e:
         app.logger.error(f"dashboard_stats error: {e}")
-        return jsonify({'total_users':0,'total_campaigns':0,'total_orders':0,'total_groups':0,'pending_withdrawals':0,'total_revenue':0.0}), 200
+        return jsonify({
+            'total_users': 0, 'total_campaigns': 0, 'total_orders': 0,
+            'total_groups': 0, 'pending_withdrawals': 0, 'total_revenue': 0.0
+        }), 200
 
 @app.route('/api/dashboard/stats', methods=['GET'])
 @jwt_required(optional=True)
@@ -596,8 +576,7 @@ def get_users():
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', 10, type=int)
     limit = request.args.get('limit', type=int)
-    if limit:
-        per_page = limit
+    if limit: per_page = limit
     search = request.args.get('search', '')
     q = User.query
     if search:
@@ -619,7 +598,7 @@ def get_users_alias():
     return get_users()
 
 # ============================================================
-# ORDERS
+# ORDERS (FILTRE USER SI NON-ADMIN)
 # ============================================================
 @app.route('/api/v1/orders', methods=['GET'])
 @jwt_required(optional=True)
@@ -627,9 +606,18 @@ def get_orders():
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', 10, type=int)
     limit = request.args.get('limit', type=int)
-    if limit:
-        per_page = limit
+    if limit: per_page = limit
+
+    # Filtrage par user si connecte et non-admin
     q = Order.query.order_by(Order.created_at.desc())
+    try:
+        user_id = int(get_jwt_identity())
+        user = User.query.get(user_id)
+        if user and user.role not in ['admin', 'superadmin']:
+            q = q.filter_by(user_id=user_id)
+    except:
+        pass
+
     total = q.count()
     orders = q.offset((page - 1) * per_page).limit(per_page).all()
     user_ids = [o.user_id for o in orders if o.user_id]
@@ -870,7 +858,7 @@ def init_db():
 # ============================================================
 @app.route('/')
 def index():
-    return jsonify({'status': 'ok', 'version': '2.7.1', 'service': 'Coalition 509 API'})
+    return jsonify({'status': 'ok', 'version': '2.7.2', 'service': 'Coalition 509 API'})
 
 @app.route('/api/health')
 def health():
