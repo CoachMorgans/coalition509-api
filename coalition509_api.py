@@ -1,6 +1,6 @@
 """
 Coalition 509 SaaS - Backend Flask
-Version: 2.7.0 (Profil editable + Paiement + Export CSV)
+Version: 2.7.1 (Fix Stats + Paiement + Export CSV)
 Fichier: coalition509_api.py
 Deploy: Render + Supabase PostgreSQL
 """
@@ -132,10 +132,10 @@ class Payment(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'))
     amount = db.Column(db.Numeric(12, 2), default=0)
     currency = db.Column(db.String(10), default='HTG')
-    payment_method = db.Column(db.String(50))  # moncash, natcash, paypal, stripe
+    payment_method = db.Column(db.String(50))
     transaction_id = db.Column(db.String(255))
-    status = db.Column(db.String(20), default='pending')  # pending, completed, failed
-    phone = db.Column(db.String(20))  # pour MonCash/NatCash
+    status = db.Column(db.String(20), default='pending')
+    phone = db.Column(db.String(20))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -257,18 +257,13 @@ def me():
         return jsonify({'detail': 'Utilisateur non trouve'}), 404
     return jsonify(user_to_dict(user))
 
-# ============================================================
-# PROFIL EDITABLE (NOUVEAU)
-# ============================================================
 @app.route('/api/v1/auth/me', methods=['PUT'])
 @jwt_required()
 def update_me():
-    """Mise a jour du profil utilisateur connecte."""
     user = User.query.get(int(get_jwt_identity()))
     if not user:
         return jsonify({'detail': 'Utilisateur non trouve'}), 404
     data = request.get_json() or {}
-
     if 'first_name' in data:
         user.first_name = data['first_name'].strip()
     if 'last_name' in data:
@@ -293,7 +288,6 @@ def update_me():
         pin = str(data['pin'])
         if len(pin) == 4 and pin.isdigit():
             user.pin_hash = hash_pin(pin)
-
     user.updated_at = datetime.utcnow()
     db.session.commit()
     return jsonify(user_to_dict(user))
@@ -405,58 +399,41 @@ def get_bot_stats_history():
     } for r in rows]), 200
 
 # ============================================================
-# PAIEMENT (NOUVEAU)
+# PAIEMENT
 # ============================================================
 @app.route('/api/v1/payments/init', methods=['POST'])
 @jwt_required()
 def init_payment():
-    """Initie un paiement pour une commande."""
     data = request.get_json() or {}
     order_id = data.get('order_id')
-    method = data.get('method', 'moncash')  # moncash, natcash, paypal, stripe
+    method = data.get('method', 'moncash')
     phone = data.get('phone', '')
-
     if not order_id:
         return jsonify({'detail': 'order_id requis'}), 400
-
     order = Order.query.get(order_id)
     if not order:
         return jsonify({'detail': 'Commande non trouvee'}), 404
-
     user_id = int(get_jwt_identity())
     if order.user_id != user_id and not User.query.get(user_id).role in ['admin', 'superadmin']:
         return jsonify({'detail': 'Permission refusee'}), 403
-
-    # Generer un ID de transaction unique
     tx_id = f"TX-{secrets.token_hex(8).upper()}"
-
     payment = Payment(
-        order_id=order_id,
-        user_id=user_id,
-        amount=order.total_amount,
-        currency='HTG',
-        payment_method=method,
-        transaction_id=tx_id,
-        status='pending',
-        phone=phone
+        order_id=order_id, user_id=user_id,
+        amount=order.total_amount, currency='HTG',
+        payment_method=method, transaction_id=tx_id,
+        status='pending', phone=phone
     )
     db.session.add(payment)
     db.session.commit()
-
-    # Simulation: selon la methode, retourner des instructions
     instructions = {
         'moncash': f"Envoyez {float(order.total_amount)} Gdes au numero MonCash officiel de Coalition 509. Reference: {tx_id}",
         'natcash': f"Envoyez {float(order.total_amount)} Gdes au numero NatCash officiel. Reference: {tx_id}",
         'paypal': f"Paiement PayPal simule. Reference: {tx_id}",
         'stripe': f"Paiement Stripe simule. Reference: {tx_id}"
     }
-
     return jsonify({
-        'ok': True,
-        'payment_id': payment.id,
-        'transaction_id': tx_id,
-        'amount': float(order.total_amount),
-        'method': method,
+        'ok': True, 'payment_id': payment.id, 'transaction_id': tx_id,
+        'amount': float(order.total_amount), 'method': method,
         'instructions': instructions.get(method, 'Paiement en attente'),
         'status': 'pending'
     })
@@ -464,45 +441,33 @@ def init_payment():
 @app.route('/api/v1/payments/confirm', methods=['POST'])
 @jwt_required()
 def confirm_payment():
-    """Confirme un paiement (simule la verification)."""
     data = request.get_json() or {}
     payment_id = data.get('payment_id')
     tx_id = data.get('transaction_id')
-
     payment = Payment.query.filter(
         (Payment.id == payment_id) | (Payment.transaction_id == tx_id)
     ).first()
-
     if not payment:
         return jsonify({'detail': 'Paiement non trouve'}), 404
-
-    # Simulation: marquer comme paye
     payment.status = 'completed'
     payment.updated_at = datetime.utcnow()
-
-    # Mettre a jour la commande
     order = Order.query.get(payment.order_id)
     if order:
         order.payment_status = 'paid'
         order.status = 'completed'
         order.payment_method = payment.payment_method
-
     db.session.commit()
     return jsonify({
-        'ok': True,
-        'message': 'Paiement confirme',
+        'ok': True, 'message': 'Paiement confirme',
         'payment': {
-            'id': payment.id,
-            'transaction_id': payment.transaction_id,
-            'status': payment.status,
-            'amount': float(payment.amount)
+            'id': payment.id, 'transaction_id': payment.transaction_id,
+            'status': payment.status, 'amount': float(payment.amount)
         }
     })
 
 @app.route('/api/v1/payments', methods=['GET'])
 @jwt_required()
 def get_payments():
-    """Liste les paiements de l'utilisateur."""
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
     q = Payment.query
@@ -510,23 +475,18 @@ def get_payments():
         q = q.filter_by(user_id=user_id)
     payments = q.order_by(Payment.created_at.desc()).all()
     return jsonify([{
-        'id': p.id,
-        'order_id': p.order_id,
-        'amount': float(p.amount),
-        'currency': p.currency,
-        'method': p.payment_method,
-        'status': p.status,
-        'transaction_id': p.transaction_id,
+        'id': p.id, 'order_id': p.order_id, 'amount': float(p.amount),
+        'currency': p.currency, 'method': p.payment_method,
+        'status': p.status, 'transaction_id': p.transaction_id,
         'created_at': p.created_at.isoformat() if p.created_at else None
     } for p in payments])
 
 # ============================================================
-# EXPORT CSV (NOUVEAU)
+# EXPORT CSV
 # ============================================================
 @app.route('/api/v1/export/campaigns', methods=['GET'])
 @jwt_required()
 def export_campaigns_csv():
-    """Exporte les campagnes en CSV."""
     campaigns = Campaign.query.order_by(Campaign.created_at.desc()).all()
     output = io.StringIO()
     writer = csv.writer(output)
@@ -543,15 +503,12 @@ def export_campaigns_csv():
         ])
     output.seek(0)
     return Response(
-        output.getvalue(),
-        mimetype='text/csv',
-        headers={'Content-Disposition': 'attachment; filename=campaigns.csv'}
-    )
+        output.getvalue(), mimetype='text/csv',
+        headers={'Content-Disposition': 'attachment; filename=campaigns.csv'}    )
 
 @app.route('/api/v1/export/orders', methods=['GET'])
 @jwt_required()
 def export_orders_csv():
-    """Exporte les commandes en CSV."""
     orders = Order.query.order_by(Order.created_at.desc()).all()
     output = io.StringIO()
     writer = csv.writer(output)
@@ -569,15 +526,12 @@ def export_orders_csv():
         ])
     output.seek(0)
     return Response(
-        output.getvalue(),
-        mimetype='text/csv',
-        headers={'Content-Disposition': 'attachment; filename=orders.csv'}
-    )
+        output.getvalue(), mimetype='text/csv',
+        headers={'Content-Disposition': 'attachment; filename=orders.csv'}    )
 
 @app.route('/api/v1/export/users', methods=['GET'])
 @jwt_required()
 def export_users_csv():
-    """Exporte les utilisateurs en CSV (admin uniquement)."""
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
     if user.role not in ['admin', 'superadmin']:
@@ -596,31 +550,37 @@ def export_users_csv():
         ])
     output.seek(0)
     return Response(
-        output.getvalue(),
-        mimetype='text/csv',
-        headers={'Content-Disposition': 'attachment; filename=users.csv'}
-    )
+        output.getvalue(), mimetype='text/csv',
+        headers={'Content-Disposition': 'attachment; filename=users.csv'}    )
 
 # ============================================================
-# DASHBOARD STATS
+# DASHBOARD STATS (ROBUSTE)
 # ============================================================
 @app.route('/api/v1/dashboard/stats', methods=['GET'])
 @jwt_required(optional=True)
 def dashboard_stats():
-    total_users = User.query.count()
-    total_campaigns = Campaign.query.count()
-    total_orders = Order.query.count()
-    total_groups = Group.query.count()
-    pending_withdrawals = Withdrawal.query.filter_by(status='pending').count()
-    total_revenue = db.session.query(func.sum(Order.total_amount)).filter_by(payment_status='paid').scalar() or 0
-    return jsonify({
-        'total_users': total_users,
-        'total_campaigns': total_campaigns,
-        'total_orders': total_orders,
-        'total_groups': total_groups,
-        'pending_withdrawals': pending_withdrawals,
-        'total_revenue': float(total_revenue)
-    })
+    try:
+        total_users = User.query.count()
+        total_campaigns = Campaign.query.count()
+        total_orders = Order.query.count()
+        total_groups = Group.query.count()
+        pending_withdrawals = Withdrawal.query.filter_by(status='pending').count()
+        total_revenue = db.session.query(func.sum(Order.total_amount)).filter_by(payment_status='paid').scalar()
+        if total_revenue is None:
+            total_revenue = 0.0
+        else:
+            total_revenue = float(total_revenue)
+        return jsonify({
+            'total_users': total_users,
+            'total_campaigns': total_campaigns,
+            'total_orders': total_orders,
+            'total_groups': total_groups,
+            'pending_withdrawals': pending_withdrawals,
+            'total_revenue': total_revenue
+        })
+    except Exception as e:
+        app.logger.error(f"dashboard_stats error: {e}")
+        return jsonify({'total_users':0,'total_campaigns':0,'total_orders':0,'total_groups':0,'pending_withdrawals':0,'total_revenue':0.0}), 200
 
 @app.route('/api/dashboard/stats', methods=['GET'])
 @jwt_required(optional=True)
@@ -635,6 +595,9 @@ def dashboard_stats_alias():
 def get_users():
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', 10, type=int)
+    limit = request.args.get('limit', type=int)
+    if limit:
+        per_page = limit
     search = request.args.get('search', '')
     q = User.query
     if search:
@@ -663,6 +626,9 @@ def get_users_alias():
 def get_orders():
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', 10, type=int)
+    limit = request.args.get('limit', type=int)
+    if limit:
+        per_page = limit
     q = Order.query.order_by(Order.created_at.desc())
     total = q.count()
     orders = q.offset((page - 1) * per_page).limit(per_page).all()
@@ -904,7 +870,7 @@ def init_db():
 # ============================================================
 @app.route('/')
 def index():
-    return jsonify({'status': 'ok', 'version': '2.7.0', 'service': 'Coalition 509 API'})
+    return jsonify({'status': 'ok', 'version': '2.7.1', 'service': 'Coalition 509 API'})
 
 @app.route('/api/health')
 def health():
