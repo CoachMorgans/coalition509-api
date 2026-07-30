@@ -1,5 +1,5 @@
 """
-Coalition 509 API — Backend v2.7.6
+Coalition 509 API — Backend v2.7.7
 Alias /api/v1/* ajoutes pour compatibilite frontend v1.5.2 sans modification.
 """
 
@@ -622,7 +622,22 @@ def v1_verify_bot_token():
 @v1_bp.route('/dashboard/stats', methods=['GET'])
 @token_required
 def v1_dashboard_stats():
-    return stats_overview()
+    total_users = User.query.count()
+    total_campaigns = Campaign.query.count()
+    total_orders = Order.query.count()
+    pending_orders = Order.query.filter_by(payment_status='pending').count()
+    paid_orders = Order.query.filter_by(payment_status='paid').count()
+    total_revenue = db.session.query(db.func.sum(Order.total_amount)).filter_by(payment_status='paid').scalar() or 0
+    return jsonify({
+        'total_users': total_users,
+        'total_campaigns': total_campaigns,
+        'total_orders': total_orders,
+        'pending_orders': pending_orders,
+        'paid_orders': paid_orders,
+        'total_revenue': float(total_revenue),
+        'total_groups': 0,
+        'pending_withdrawals': 0
+    })
 
 # Campaigns aliases
 @v1_bp.route('/campaigns', methods=['GET'])
@@ -688,7 +703,37 @@ def v1_export(type):
 @v1_bp.route('/bot/stats', methods=['GET'])
 @token_required
 def v1_bot_stats():
-    return bot_stats()
+    since = datetime.datetime.utcnow() - datetime.timedelta(days=7)
+    msgs = BotMessage.query.filter(BotMessage.created_at >= since).all()
+    by_day = {}
+    for m in msgs:
+        day = m.created_at.strftime('%Y-%m-%d')
+        if day not in by_day:
+            by_day[day] = {'sent': 0, 'received': 0}
+        if m.direction == 'out':
+            by_day[day]['sent'] += 1
+        else:
+            by_day[day]['received'] += 1
+    days = sorted(by_day.keys())
+    total_sent = sum(by_day[d]['sent'] for d in days)
+    total_received = sum(by_day[d]['received'] for d in days)
+    unique = BotMessage.query.with_entities(BotMessage.phone).distinct().count()
+    return jsonify({
+        'latest': {
+            'total_conversations': total_sent + total_received,
+            'active_conversations': unique,
+            'leads_generated': 0,
+            'conversions': 0,
+            'messages_sent': total_sent,
+            'bot_version': '1.2.0',
+            'recorded_at': datetime.datetime.utcnow().isoformat()
+        },
+        'week': {
+            'leads': 0,
+            'conversions': 0,
+            'messages': total_sent + total_received
+        }
+    })
 
 @v1_bp.route('/bot/stats/history', methods=['GET'])
 @token_required
@@ -715,7 +760,7 @@ app.register_blueprint(v1_bp)  # Alias /api/v1/*
 def index():
     return jsonify({
         'service': 'Coalition 509 API',
-        'version': '2.7.6',
+        'version': '2.7.7',
         'status': 'ok'
     })
 
