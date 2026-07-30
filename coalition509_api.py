@@ -1,6 +1,7 @@
 """
-Coalition 509 API — Backend v2.7.7
-Alias /api/v1/* ajoutes pour compatibilite frontend v1.5.2 sans modification.
+Coalition 509 API — Backend v2.7.8
+Fix : /api/bot/stats et /api/v1/bot/stats retournent désormais {latest, week}
+       pour matcher le frontend v1.5.2.
 """
 
 import os
@@ -118,6 +119,86 @@ def admin_required(f):
         return f(*args, **kwargs)
     return decorated
 
+# ─── HELPER : STATS BOT (format frontend v1.5.2) ───────────────────
+
+def build_bot_stats_response():
+    """Construit la réponse {latest, week} attendue par le frontend."""
+    today = datetime.date.today()
+
+    # ── Dernières stats (BotStat le plus récent) ──
+    latest_stat = BotStat.query.order_by(BotStat.date.desc()).first()
+    if latest_stat:
+        latest = {
+            "leads": latest_stat.unique_users or 0,
+            "conversations": latest_stat.messages_received or 0,
+            "messages": (latest_stat.messages_sent or 0) + (latest_stat.messages_received or 0),
+            "conversions": 0,
+            "date": latest_stat.date.isoformat() if latest_stat.date else None
+        }
+    else:
+        # Fallback sur BotMessage (24h)
+        since = datetime.datetime.utcnow() - datetime.timedelta(days=1)
+        msgs_today = BotMessage.query.filter(BotMessage.created_at >= since).all()
+        total_msgs = len(msgs_today)
+        unique = BotMessage.query.with_entities(BotMessage.phone).distinct().count()
+        latest = {
+            "leads": unique or 0,
+            "conversations": total_msgs,
+            "messages": total_msgs,
+            "conversions": 0,
+            "date": today.isoformat()
+        }
+
+    # ── Stats des 7 derniers jours ──
+    week_ago = today - datetime.timedelta(days=6)
+    week_stats = BotStat.query.filter(BotStat.date >= week_ago).order_by(BotStat.date.asc()).all()
+
+    if week_stats:
+        week = []
+        for s in week_stats:
+            week.append({
+                "date": s.date.strftime("%Y-%m-%d") if s.date else None,
+                "leads": s.unique_users or 0,
+                "conversations": s.messages_received or 0,
+                "messages": (s.messages_sent or 0) + (s.messages_received or 0),
+                "conversions": 0
+            })
+    else:
+        # Fallback sur BotMessage agrégés par jour
+        since = datetime.datetime.utcnow() - datetime.timedelta(days=7)
+        msgs = BotMessage.query.filter(BotMessage.created_at >= since).all()
+        by_day = {}
+        for m in msgs:
+            day = m.created_at.strftime('%Y-%m-%d')
+            if day not in by_day:
+                by_day[day] = {'messages': 0, 'conversations': 0, 'phones': set()}
+            by_day[day]['messages'] += 1
+            by_day[day]['conversations'] += 1
+            by_day[day]['phones'].add(m.phone or '')
+        week = []
+        for d in sorted(by_day.keys()):
+            week.append({
+                "date": d,
+                "leads": len(by_day[d]['phones']),
+                "conversations": by_day[d]['conversations'],
+                "messages": by_day[d]['messages'],
+                "conversions": 0
+            })
+
+    # Remplir les jours manquants si moins de 7 entrées
+    if len(week) < 7:
+        existing_dates = {w['date'] for w in week}
+        for i in range(7):
+            d = (today - datetime.timedelta(days=6-i)).strftime("%Y-%m-%d")
+            if d not in existing_dates:
+                week.insert(i, {
+                    "date": d,
+                    "leads": 0, "conversations": 0, "messages": 0, "conversions": 0
+                })
+        week = sorted(week, key=lambda x: x['date'])
+
+    return {"latest": latest, "week": week}
+
 # ─── BLUEPRINT : AUTH ──────────────────────────────────────────────
 
 from flask import Blueprint
@@ -200,7 +281,6 @@ def verify_bot_token():
     bot_token = data.get('token', '')
     if not bot_token:
         return jsonify({'ok': False, 'error': 'Token manquant'}), 400
-    # Verifier le token bot (format attendu: phone|signature)
     try:
         phone = bot_token.split('|')[0] if '|' in bot_token else bot_token
         user = User.query.filter_by(phone=phone).first()
@@ -442,31 +522,8 @@ bot_bp = Blueprint('bot', __name__, url_prefix='/api/bot')
 @bot_bp.route('/stats', methods=['GET'])
 @token_required
 def bot_stats():
-    since = datetime.datetime.utcnow() - datetime.timedelta(days=7)
-    msgs = BotMessage.query.filter(BotMessage.created_at >= since).all()
-    by_day = {}
-    for m in msgs:
-        day = m.created_at.strftime('%Y-%m-%d')
-        if day not in by_day:
-            by_day[day] = {'sent': 0, 'received': 0}
-        if m.direction == 'out':
-            by_day[day]['sent'] += 1
-        else:
-            by_day[day]['received'] += 1
-    days = sorted(by_day.keys())
-    chart_data = [{'date': d, 'sent': by_day[d]['sent'], 'received': by_day[d]['received']} for d in days]
-    total_sent = sum(d['sent'] for d in chart_data)
-    total_received = sum(d['received'] for d in chart_data)
-    unique = BotMessage.query.with_entities(BotMessage.phone).distinct().count()
-    return jsonify({
-        'status': 'success',
-        'stats': {
-            'total_messages_sent': total_sent,
-            'total_messages_received': total_received,
-            'unique_users': unique,
-            'chart_data': chart_data
-        }
-    })
+    """Retourne les stats bot au format {latest, week} pour le frontend v1.5.2"""
+    return jsonify(build_bot_stats_response())
 
 @bot_bp.route('/stats/history', methods=['GET'])
 @token_required
@@ -699,41 +756,11 @@ def v1_export(type):
     from flask import Response
     return Response(output.getvalue(), mimetype='text/csv', headers={'Content-Disposition': f'attachment; filename={type}.csv'})
 
-# Bot aliases
+# Bot aliases — FIX v2.7.8 : même format {latest, week}
 @v1_bp.route('/bot/stats', methods=['GET'])
 @token_required
 def v1_bot_stats():
-    since = datetime.datetime.utcnow() - datetime.timedelta(days=7)
-    msgs = BotMessage.query.filter(BotMessage.created_at >= since).all()
-    by_day = {}
-    for m in msgs:
-        day = m.created_at.strftime('%Y-%m-%d')
-        if day not in by_day:
-            by_day[day] = {'sent': 0, 'received': 0}
-        if m.direction == 'out':
-            by_day[day]['sent'] += 1
-        else:
-            by_day[day]['received'] += 1
-    days = sorted(by_day.keys())
-    total_sent = sum(by_day[d]['sent'] for d in days)
-    total_received = sum(by_day[d]['received'] for d in days)
-    unique = BotMessage.query.with_entities(BotMessage.phone).distinct().count()
-    return jsonify({
-        'latest': {
-            'total_conversations': total_sent + total_received,
-            'active_conversations': unique,
-            'leads_generated': 0,
-            'conversions': 0,
-            'messages_sent': total_sent,
-            'bot_version': '1.2.0',
-            'recorded_at': datetime.datetime.utcnow().isoformat()
-        },
-        'week': {
-            'leads': 0,
-            'conversions': 0,
-            'messages': total_sent + total_received
-        }
-    })
+    return jsonify(build_bot_stats_response())
 
 @v1_bp.route('/bot/stats/history', methods=['GET'])
 @token_required
@@ -760,7 +787,7 @@ app.register_blueprint(v1_bp)  # Alias /api/v1/*
 def index():
     return jsonify({
         'service': 'Coalition 509 API',
-        'version': '2.7.7',
+        'version': '2.7.8',
         'status': 'ok'
     })
 
