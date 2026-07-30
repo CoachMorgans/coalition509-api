@@ -1,5 +1,5 @@
 """
-Coalition 509 API — Backend v2.7.5
+Coalition 509 API — Backend v2.7.6
 Alias /api/v1/* ajoutes pour compatibilite frontend v1.5.2 sans modification.
 """
 
@@ -138,6 +138,7 @@ def login():
     return jsonify({
         'status': 'success',
         'token': user.phone,
+        'access_token': user.phone,
         'user': {
             'id': user.id, 'phone': user.phone, 'first_name': user.first_name,
             'last_name': user.last_name, 'email': user.email, 'role': user.role,
@@ -714,7 +715,7 @@ app.register_blueprint(v1_bp)  # Alias /api/v1/*
 def index():
     return jsonify({
         'service': 'Coalition 509 API',
-        'version': '2.7.5',
+        'version': '2.7.6',
         'status': 'ok'
     })
 
