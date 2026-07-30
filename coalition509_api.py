@@ -1,6 +1,6 @@
 """
-Coalition 509 API — Backend v2.7.4
-Fix init-db : DROP SCHEMA CASCADE pour PostgreSQL.
+Coalition 509 API — Backend v2.7.5
+Alias /api/v1/* ajoutes pour compatibilite frontend v1.5.2 sans modification.
 """
 
 import os
@@ -146,6 +146,39 @@ def login():
         }
     })
 
+@auth_bp.route('/register', methods=['POST'])
+def register():
+    data = request.get_json() or {}
+    phone = data.get('phone', '').strip()
+    pin = data.get('pin', '').strip()
+    first_name = data.get('first_name', '').strip()
+    last_name = data.get('last_name', '').strip()
+    if not phone or not pin or not first_name or not last_name:
+        return jsonify({'status': 'error', 'message': 'Champs obligatoires manquants'}), 400
+    if User.query.filter_by(phone=phone).first():
+        return jsonify({'status': 'error', 'message': 'Telephone deja utilise'}), 409
+    user = User(
+        phone=phone, pin_hash=hash_pin(pin),
+        first_name=first_name, last_name=last_name,
+        email=data.get('email', ''), role='user', status='active',
+        region=data.get('region', ''), commune=data.get('commune', ''),
+        profile_type=data.get('profile_type', 'Animateur NGD'),
+        ngd_id=generate_ngd_id()
+    )
+    db.session.add(user)
+    db.session.commit()
+    return jsonify({
+        'status': 'success',
+        'id': user.id,
+        'ngd_id': user.ngd_id,
+        'user': {
+            'id': user.id, 'phone': user.phone, 'first_name': user.first_name,
+            'last_name': user.last_name, 'email': user.email, 'role': user.role,
+            'region': user.region, 'commune': user.commune,
+            'profile_type': user.profile_type, 'ngd_id': user.ngd_id
+        }
+    }), 201
+
 @auth_bp.route('/me', methods=['GET'])
 @token_required
 def me():
@@ -159,6 +192,32 @@ def me():
             'profile_type': u.profile_type, 'ngd_id': u.ngd_id
         }
     })
+
+@auth_bp.route('/verify-bot-token', methods=['POST'])
+def verify_bot_token():
+    data = request.get_json() or {}
+    bot_token = data.get('token', '')
+    if not bot_token:
+        return jsonify({'ok': False, 'error': 'Token manquant'}), 400
+    # Verifier le token bot (format attendu: phone|signature)
+    try:
+        phone = bot_token.split('|')[0] if '|' in bot_token else bot_token
+        user = User.query.filter_by(phone=phone).first()
+        if user:
+            return jsonify({
+                'ok': True,
+                'access_token': user.phone,
+                'user': {
+                    'id': user.id, 'phone': user.phone, 'first_name': user.first_name,
+                    'last_name': user.last_name, 'email': user.email, 'role': user.role,
+                    'region': user.region, 'commune': user.commune,
+                    'profile_type': user.profile_type, 'ngd_id': user.ngd_id
+                }
+            })
+        else:
+            return jsonify({'ok': True, 'needs_registration': True, 'phone': phone})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 400
 
 # ─── BLUEPRINT : USERS ─────────────────────────────────────────────
 
@@ -337,7 +396,7 @@ def get_order():
 @token_required
 def pay_order():
     data = request.get_json() or {}
-    oid = data.get('id')
+    oid = data.get('id') or data.get('order_id')
     method = data.get('payment_method', 'mobile_money')
     if not oid:
         return jsonify({'status': 'error', 'message': 'id requis'}), 400
@@ -408,6 +467,22 @@ def bot_stats():
         }
     })
 
+@bot_bp.route('/stats/history', methods=['GET'])
+@token_required
+def bot_stats_history():
+    days = request.args.get('days', 7, type=int)
+    since = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+    msgs = BotMessage.query.filter(BotMessage.created_at >= since).all()
+    by_day = {}
+    for m in msgs:
+        day = m.created_at.strftime('%Y-%m-%d')
+        if day not in by_day:
+            by_day[day] = {'conversations': 0, 'leads': 0, 'messages': 0}
+        by_day[day]['messages'] += 1
+        by_day[day]['conversations'] += 1
+    result = [{'date': d, 'conversations': by_day[d]['conversations'], 'leads': by_day[d]['leads'], 'messages': by_day[d]['messages']} for d in sorted(by_day.keys())]
+    return jsonify(result)
+
 @bot_bp.route('/stats', methods=['POST'])
 def bot_stats_post():
     data = request.get_json() or {}
@@ -423,14 +498,13 @@ def bot_stats_post():
     db.session.commit()
     return jsonify({'status': 'success'})
 
-# ─── BLUEPRINT : INIT-DB (FIX CASCADE) ─────────────────────────────
+# ─── BLUEPRINT : INIT-DB ───────────────────────────────────────────
 
 init_bp = Blueprint('init', __name__, url_prefix='/api')
 
 @init_bp.route('/init-db', methods=['GET'])
 def init_db():
     try:
-        # PostgreSQL CASCADE : drop schema complet puis recreer
         db.session.execute(db.text("DROP SCHEMA IF EXISTS public CASCADE"))
         db.session.execute(db.text("CREATE SCHEMA public"))
         db.session.commit()
@@ -518,7 +592,111 @@ def seed():
         db.session.rollback()
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-# ─── ENREGISTREMENT DES BLUEPRINTS ─────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# ALIAS /api/v1/* pour compatibilite frontend v1.5.2
+# ═══════════════════════════════════════════════════════════════════
+
+from flask import Blueprint
+v1_bp = Blueprint('v1', __name__, url_prefix='/api/v1')
+
+# Auth aliases
+@v1_bp.route('/auth/login', methods=['POST'])
+def v1_login():
+    return login()
+
+@v1_bp.route('/auth/register', methods=['POST'])
+def v1_register():
+    return register()
+
+@v1_bp.route('/auth/me', methods=['GET'])
+@token_required
+def v1_me():
+    return me()
+
+@v1_bp.route('/auth/verify-bot-token', methods=['POST'])
+def v1_verify_bot_token():
+    return verify_bot_token()
+
+# Dashboard stats alias
+@v1_bp.route('/dashboard/stats', methods=['GET'])
+@token_required
+def v1_dashboard_stats():
+    return stats_overview()
+
+# Campaigns aliases
+@v1_bp.route('/campaigns', methods=['GET'])
+@token_required
+def v1_list_campaigns():
+    return list_campaigns()
+
+@v1_bp.route('/campaigns', methods=['POST'])
+@token_required
+def v1_create_campaign():
+    return create_campaign()
+
+# Users alias
+@v1_bp.route('/users', methods=['GET'])
+@token_required
+def v1_list_users():
+    return list_users()
+
+# Orders alias
+@v1_bp.route('/orders', methods=['GET'])
+@token_required
+def v1_list_orders():
+    return list_orders()
+
+# Payments alias (map vers orders/pay)
+@v1_bp.route('/payments/init', methods=['POST'])
+@token_required
+def v1_payments_init():
+    return pay_order()
+
+@v1_bp.route('/payments/confirm', methods=['POST'])
+@token_required
+def v1_payments_confirm():
+    data = request.get_json() or {}
+    return jsonify({'ok': True, 'status': 'confirmed', 'payment_id': data.get('payment_id')})
+
+# Export alias
+@v1_bp.route('/export/<type>', methods=['GET'])
+@token_required
+def v1_export(type):
+    import csv, io
+    output = io.StringIO()
+    writer = csv.writer(output)
+    if type == 'users':
+        writer.writerow(['ID', 'Phone', 'Nom', 'Prenom', 'Email', 'Role', 'Region', 'Commune'])
+        for u in User.query.all():
+            writer.writerow([u.id, u.phone, u.last_name, u.first_name, u.email, u.role, u.region, u.commune])
+    elif type == 'orders':
+        writer.writerow(['ID', 'Numero', 'Montant', 'Statut', 'Paiement', 'Region', 'Commune'])
+        for o in Order.query.all():
+            writer.writerow([o.id, o.order_number, o.total_amount, o.status, o.payment_status, o.region, o.commune])
+    elif type == 'campaigns':
+        writer.writerow(['ID', 'Nom', 'Region', 'Commune', 'Statut', 'Date'])
+        for c in Campaign.query.all():
+            writer.writerow([c.id, c.name, c.region, c.commune, c.status, c.election_date])
+    else:
+        writer.writerow(['Message', 'Aucune donnee'])
+    output.seek(0)
+    from flask import Response
+    return Response(output.getvalue(), mimetype='text/csv', headers={'Content-Disposition': f'attachment; filename={type}.csv'})
+
+# Bot aliases
+@v1_bp.route('/bot/stats', methods=['GET'])
+@token_required
+def v1_bot_stats():
+    return bot_stats()
+
+@v1_bp.route('/bot/stats/history', methods=['GET'])
+@token_required
+def v1_bot_stats_history():
+    return bot_stats_history()
+
+# ═══════════════════════════════════════════════════════════════════
+# ENREGISTREMENT DES BLUEPRINTS
+# ═══════════════════════════════════════════════════════════════════
 
 app.register_blueprint(auth_bp)
 app.register_blueprint(users_bp)
@@ -528,6 +706,7 @@ app.register_blueprint(stats_bp)
 app.register_blueprint(bot_bp)
 app.register_blueprint(init_bp)
 app.register_blueprint(seed_bp)
+app.register_blueprint(v1_bp)  # Alias /api/v1/*
 
 # ─── ROUTE RACINE ──────────────────────────────────────────────────
 
@@ -535,7 +714,7 @@ app.register_blueprint(seed_bp)
 def index():
     return jsonify({
         'service': 'Coalition 509 API',
-        'version': '2.7.4',
+        'version': '2.7.5',
         'status': 'ok'
     })
 
