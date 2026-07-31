@@ -1,16 +1,18 @@
 """
-Coalition 509 API — Backend v2.7.8
-Fix : /api/bot/stats et /api/v1/bot/stats retournent désormais {latest, week}
-       pour matcher le frontend v1.5.2.
+Coalition 509 API — Backend v2.7.9
+Fix : GET /api/bot/stats PUBLIC (sans JWT) + POST /api/bot/stats accepte vraies stats bot
+      + route /api/bot/generate-token pour auto-auth bot
+      + modèle BotStat avec colonne conversions
 """
 
 import os
 import uuid
 import hashlib
 import datetime
+import time
 from functools import wraps
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Blueprint
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 
@@ -82,6 +84,7 @@ class BotStat(db.Model):
     messages_sent = db.Column(db.Integer, default=0)
     messages_received = db.Column(db.Integer, default=0)
     unique_users = db.Column(db.Integer, default=0)
+    conversions = db.Column(db.Integer, default=0)
 
 # ─── UTILS ───────────────────────────────────────────────────────────
 
@@ -132,7 +135,7 @@ def build_bot_stats_response():
             "leads": latest_stat.unique_users or 0,
             "conversations": latest_stat.messages_received or 0,
             "messages": (latest_stat.messages_sent or 0) + (latest_stat.messages_received or 0),
-            "conversions": 0,
+            "conversions": latest_stat.conversions or 0,
             "date": latest_stat.date.isoformat() if latest_stat.date else None
         }
     else:
@@ -161,7 +164,7 @@ def build_bot_stats_response():
                 "leads": s.unique_users or 0,
                 "conversations": s.messages_received or 0,
                 "messages": (s.messages_sent or 0) + (s.messages_received or 0),
-                "conversions": 0
+                "conversions": s.conversions or 0
             })
     else:
         # Fallback sur BotMessage agrégés par jour
@@ -201,7 +204,6 @@ def build_bot_stats_response():
 
 # ─── BLUEPRINT : AUTH ──────────────────────────────────────────────
 
-from flask import Blueprint
 auth_bp = Blueprint('auth', __name__, url_prefix='/api/auth')
 
 @auth_bp.route('/login', methods=['POST'])
@@ -520,9 +522,8 @@ def stats_overview():
 bot_bp = Blueprint('bot', __name__, url_prefix='/api/bot')
 
 @bot_bp.route('/stats', methods=['GET'])
-@token_required
 def bot_stats():
-    """Retourne les stats bot au format {latest, week} pour le frontend v1.5.2"""
+    """Retourne les stats bot au format {latest, week} — PUBLIC, pas de JWT requis."""
     return jsonify(build_bot_stats_response())
 
 @bot_bp.route('/stats/history', methods=['GET'])
@@ -543,18 +544,40 @@ def bot_stats_history():
 
 @bot_bp.route('/stats', methods=['POST'])
 def bot_stats_post():
+    """Reçoit les stats du bot (POST) et les stocke dans BotStat."""
     data = request.get_json() or {}
     api_key = request.headers.get('X-Bot-API-Key', '')
     if api_key != os.environ.get('BOT_API_KEY', 'coalition509-bot-secret-2026'):
         return jsonify({'status': 'error', 'message': 'Unauthorized'}), 401
-    msg = BotMessage(
-        phone=data.get('phone', ''),
-        message=data.get('message', ''),
-        direction=data.get('direction', 'in')
-    )
-    db.session.add(msg)
+
+    today = datetime.date.today()
+    stat = BotStat.query.filter_by(date=today).first()
+    if not stat:
+        stat = BotStat(date=today)
+        db.session.add(stat)
+
+    # Le bot envoie des compteurs cumulatifs — on met à jour avec max()
+    stat.unique_users = max(stat.unique_users or 0, data.get('leads', 0))
+    stat.messages_received = max(stat.messages_received or 0, data.get('conversations', 0))
+    stat.messages_sent = max(stat.messages_sent or 0, data.get('messages', 0))
+    stat.conversions = max(stat.conversions or 0, data.get('conversions', 0))
+
     db.session.commit()
     return jsonify({'status': 'success'})
+
+@bot_bp.route('/generate-token', methods=['POST'])
+def generate_bot_token():
+    """Génère un token d'auto-auth pour le bot WhatsApp."""
+    api_key = request.headers.get('X-Bot-Key', '')
+    if api_key != os.environ.get('BOT_API_KEY', 'coalition509-bot-secret-2026'):
+        return jsonify({'status': 'error', 'message': 'Unauthorized'}), 401
+    data = request.get_json() or {}
+    phone = data.get('phone', '').strip()
+    if not phone:
+        return jsonify({'status': 'error', 'message': 'Phone requis'}), 400
+    token_raw = f"{phone}|{int(time.time())}|{app.config['SECRET_KEY']}"
+    token = hashlib.sha256(token_raw.encode()).hexdigest()[:32]
+    return jsonify({'token': f"{phone}|{token}"})
 
 # ─── BLUEPRINT : INIT-DB ───────────────────────────────────────────
 
@@ -633,7 +656,7 @@ def seed():
 
         for i in range(7):
             d = datetime.date.today() - datetime.timedelta(days=i)
-            bs = BotStat(date=d, messages_sent=10+i, messages_received=5+i, unique_users=3)
+            bs = BotStat(date=d, messages_sent=10+i, messages_received=5+i, unique_users=3, conversions=1)
             db.session.add(bs)
         db.session.commit()
 
@@ -654,7 +677,6 @@ def seed():
 # ALIAS /api/v1/* pour compatibilite frontend v1.5.2
 # ═══════════════════════════════════════════════════════════════════
 
-from flask import Blueprint
 v1_bp = Blueprint('v1', __name__, url_prefix='/api/v1')
 
 # Auth aliases
@@ -732,33 +754,47 @@ def v1_payments_confirm():
     return jsonify({'ok': True, 'status': 'confirmed', 'payment_id': data.get('payment_id')})
 
 # Export alias
-@v1_bp.route('/export/<type>', methods=['GET'])
+@v1_bp.route('/export/users', methods=['GET'])
 @token_required
-def v1_export(type):
+def v1_export_users():
     import csv, io
     output = io.StringIO()
     writer = csv.writer(output)
-    if type == 'users':
-        writer.writerow(['ID', 'Phone', 'Nom', 'Prenom', 'Email', 'Role', 'Region', 'Commune'])
-        for u in User.query.all():
-            writer.writerow([u.id, u.phone, u.last_name, u.first_name, u.email, u.role, u.region, u.commune])
-    elif type == 'orders':
-        writer.writerow(['ID', 'Numero', 'Montant', 'Statut', 'Paiement', 'Region', 'Commune'])
-        for o in Order.query.all():
-            writer.writerow([o.id, o.order_number, o.total_amount, o.status, o.payment_status, o.region, o.commune])
-    elif type == 'campaigns':
-        writer.writerow(['ID', 'Nom', 'Region', 'Commune', 'Statut', 'Date'])
-        for c in Campaign.query.all():
-            writer.writerow([c.id, c.name, c.region, c.commune, c.status, c.election_date])
-    else:
-        writer.writerow(['Message', 'Aucune donnee'])
+    writer.writerow(['ID', 'Phone', 'Nom', 'Prenom', 'Email', 'Role', 'Region', 'Commune'])
+    for u in User.query.all():
+        writer.writerow([u.id, u.phone, u.last_name, u.first_name, u.email, u.role, u.region, u.commune])
     output.seek(0)
     from flask import Response
-    return Response(output.getvalue(), mimetype='text/csv', headers={'Content-Disposition': f'attachment; filename={type}.csv'})
+    return Response(output.getvalue(), mimetype='text/csv', headers={'Content-Disposition': 'attachment; filename=users.csv'})
 
-# Bot aliases — FIX v2.7.8 : même format {latest, week}
-@v1_bp.route('/bot/stats', methods=['GET'])
+@v1_bp.route('/export/orders', methods=['GET'])
 @token_required
+def v1_export_orders():
+    import csv, io
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['ID', 'Numero', 'Montant', 'Statut', 'Paiement', 'Region', 'Commune'])
+    for o in Order.query.all():
+        writer.writerow([o.id, o.order_number, o.total_amount, o.status, o.payment_status, o.region, o.commune])
+    output.seek(0)
+    from flask import Response
+    return Response(output.getvalue(), mimetype='text/csv', headers={'Content-Disposition': 'attachment; filename=orders.csv'})
+
+@v1_bp.route('/export/campaigns', methods=['GET'])
+@token_required
+def v1_export_campaigns():
+    import csv, io
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['ID', 'Nom', 'Region', 'Commune', 'Statut', 'Date'])
+    for c in Campaign.query.all():
+        writer.writerow([c.id, c.name, c.region, c.commune, c.status, c.election_date])
+    output.seek(0)
+    from flask import Response
+    return Response(output.getvalue(), mimetype='text/csv', headers={'Content-Disposition': 'attachment; filename=campaigns.csv'})
+
+# Bot aliases — FIX v2.7.9 : GET public (sans JWT), même format {latest, week}
+@v1_bp.route('/bot/stats', methods=['GET'])
 def v1_bot_stats():
     return jsonify(build_bot_stats_response())
 
@@ -787,7 +823,7 @@ app.register_blueprint(v1_bp)  # Alias /api/v1/*
 def index():
     return jsonify({
         'service': 'Coalition 509 API',
-        'version': '2.7.8',
+        'version': '2.7.9',
         'status': 'ok'
     })
 
