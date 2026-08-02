@@ -81,6 +81,7 @@ class BotStat(db.Model):
     __tablename__ = 'bot_stats'
     id = db.Column(db.Integer, primary_key=True)
     date = db.Column(db.Date, default=datetime.date.today)
+    source = db.Column(db.String(50), default='unknown')
     messages_sent = db.Column(db.Integer, default=0)
     messages_received = db.Column(db.Integer, default=0)
     unique_users = db.Column(db.Integer, default=0)
@@ -125,18 +126,21 @@ def admin_required(f):
 # ─── HELPER : STATS BOT (format frontend v1.5.2) ───────────────────
 
 def build_bot_stats_response():
-    """Construit la réponse {latest, week} attendue par le frontend."""
+    """Construit la réponse {latest, week} attendue par le frontend.
+    Agrège les stats de TOUS les bots (sources) par SUM."""
     today = datetime.date.today()
+    week_ago = today - datetime.timedelta(days=6)
 
-    # ── Dernières stats (BotStat le plus récent) ──
-    latest_stat = BotStat.query.order_by(BotStat.date.desc()).first()
-    if latest_stat:
+    # ── Latest = SUM de toutes les sources aujourd'hui ──
+    latest_rows = BotStat.query.filter_by(date=today).all()
+    if latest_rows:
         latest = {
-            "leads": latest_stat.unique_users or 0,
-            "conversations": latest_stat.messages_received or 0,
-            "messages": (latest_stat.messages_sent or 0) + (latest_stat.messages_received or 0),
-            "conversions": latest_stat.conversions or 0,
-            "date": latest_stat.date.isoformat() if latest_stat.date else None
+            "leads": sum(r.unique_users or 0 for r in latest_rows),
+            "conversations": sum(r.messages_received or 0 for r in latest_rows),
+            "messages": sum((r.messages_sent or 0) + (r.messages_received or 0) for r in latest_rows),
+            "conversions": sum(r.conversions or 0 for r in latest_rows),
+            "active": 0,
+            "date": today.isoformat()
         }
     else:
         # Fallback sur BotMessage (24h)
@@ -149,56 +153,43 @@ def build_bot_stats_response():
             "conversations": total_msgs,
             "messages": total_msgs,
             "conversions": 0,
+            "active": 0,
             "date": today.isoformat()
         }
 
-    # ── Stats des 7 derniers jours ──
-    week_ago = today - datetime.timedelta(days=6)
-    week_stats = BotStat.query.filter(BotStat.date >= week_ago).order_by(BotStat.date.asc()).all()
+    # ── Week = agrégation par jour (SUM de toutes les sources) ──
+    week_rows = BotStat.query.filter(BotStat.date >= week_ago).order_by(BotStat.date.asc()).all()
+    by_day = {}
+    for r in week_rows:
+        d = r.date.strftime("%Y-%m-%d") if r.date else None
+        if not d:
+            continue
+        if d not in by_day:
+            by_day[d] = {"leads": 0, "conversations": 0, "messages": 0, "conversions": 0}
+        by_day[d]["leads"] += r.unique_users or 0
+        by_day[d]["conversations"] += r.messages_received or 0
+        by_day[d]["messages"] += (r.messages_sent or 0) + (r.messages_received or 0)
+        by_day[d]["conversions"] += r.conversions or 0
 
-    if week_stats:
-        week = []
-        for s in week_stats:
-            week.append({
-                "date": s.date.strftime("%Y-%m-%d") if s.date else None,
-                "leads": s.unique_users or 0,
-                "conversations": s.messages_received or 0,
-                "messages": (s.messages_sent or 0) + (s.messages_received or 0),
-                "conversions": s.conversions or 0
-            })
-    else:
-        # Fallback sur BotMessage agrégés par jour
+    # Fallback BotMessage si aucune donnée BotStat
+    if not by_day:
         since = datetime.datetime.utcnow() - datetime.timedelta(days=7)
         msgs = BotMessage.query.filter(BotMessage.created_at >= since).all()
-        by_day = {}
         for m in msgs:
             day = m.created_at.strftime('%Y-%m-%d')
             if day not in by_day:
-                by_day[day] = {'messages': 0, 'conversations': 0, 'phones': set()}
-            by_day[day]['messages'] += 1
-            by_day[day]['conversations'] += 1
-            by_day[day]['phones'].add(m.phone or '')
-        week = []
-        for d in sorted(by_day.keys()):
-            week.append({
-                "date": d,
-                "leads": len(by_day[d]['phones']),
-                "conversations": by_day[d]['conversations'],
-                "messages": by_day[d]['messages'],
-                "conversions": 0
-            })
+                by_day[day] = {"leads": 0, "conversations": 0, "messages": 0, "conversions": 0}
+            by_day[day]["messages"] += 1
+            by_day[day]["conversations"] += 1
 
-    # Remplir les jours manquants si moins de 7 entrées
-    if len(week) < 7:
-        existing_dates = {w['date'] for w in week}
-        for i in range(7):
-            d = (today - datetime.timedelta(days=6-i)).strftime("%Y-%m-%d")
-            if d not in existing_dates:
-                week.insert(i, {
-                    "date": d,
-                    "leads": 0, "conversations": 0, "messages": 0, "conversions": 0
-                })
-        week = sorted(week, key=lambda x: x['date'])
+    # Remplir les 7 jours
+    week = []
+    for i in range(7):
+        d = (week_ago + datetime.timedelta(days=i)).strftime("%Y-%m-%d")
+        if d in by_day:
+            week.append({"date": d, **by_day[d]})
+        else:
+            week.append({"date": d, "leads": 0, "conversations": 0, "messages": 0, "conversions": 0})
 
     return {"latest": latest, "week": week}
 
@@ -544,19 +535,21 @@ def bot_stats_history():
 
 @bot_bp.route('/stats', methods=['POST'])
 def bot_stats_post():
-    """Reçoit les stats du bot (POST) et les stocke dans BotStat."""
+    """Reçoit les stats du bot (POST) et les stocke dans BotStat par source."""
     data = request.get_json() or {}
     api_key = request.headers.get('X-Bot-API-Key', '')
     if api_key != os.environ.get('BOT_API_KEY', 'coalition509-bot-secret-2026'):
         return jsonify({'status': 'error', 'message': 'Unauthorized'}), 401
 
     today = datetime.date.today()
-    stat = BotStat.query.filter_by(date=today).first()
+    source = data.get('source', 'unknown')
+    stat = BotStat.query.filter_by(date=today, source=source).first()
     if not stat:
-        stat = BotStat(date=today)
+        stat = BotStat(date=today, source=source)
         db.session.add(stat)
 
-    # Le bot envoie des compteurs cumulatifs — on met à jour avec max()
+    # max() par source : si le bot redémarre, ses compteurs ne font pas
+    # baisser la ligne des AUTRES bots. Chaque bot a sa propre ligne.
     stat.unique_users = max(stat.unique_users or 0, data.get('leads', 0))
     stat.messages_received = max(stat.messages_received or 0, data.get('conversations', 0))
     stat.messages_sent = max(stat.messages_sent or 0, data.get('messages', 0))
@@ -567,8 +560,8 @@ def bot_stats_post():
 
 @bot_bp.route('/generate-token', methods=['POST'])
 def generate_bot_token():
-    """Génère un token d'auto-auth pour le bot WhatsApp."""
-    api_key = request.headers.get('X-Bot-Key', '')
+    """Génère un token d'auto-auth pour le bot."""
+    api_key = request.headers.get('X-Bot-Key', '') or request.headers.get('X-Bot-API-Key', '')
     if api_key != os.environ.get('BOT_API_KEY', 'coalition509-bot-secret-2026'):
         return jsonify({'status': 'error', 'message': 'Unauthorized'}), 401
     data = request.get_json() or {}
@@ -823,9 +816,32 @@ app.register_blueprint(v1_bp)  # Alias /api/v1/*
 def index():
     return jsonify({
         'service': 'Coalition 509 API',
-        'version': '2.7.9',
+        'version': '2.8.0',
         'status': 'ok'
     })
+
+# ─── MIGRATION AUTO ──────────────────────────────────────────────────
+def auto_migrate():
+    """Ajoute la colonne source à bot_stats si elle n'existe pas (v2.8.0)."""
+    try:
+        with db.engine.connect() as conn:
+            result = conn.execute(db.text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='bot_stats' AND column_name='source'"
+            ))
+            if not result.fetchone():
+                conn.execute(db.text(
+                    "ALTER TABLE bot_stats ADD COLUMN source VARCHAR(50) DEFAULT 'unknown'"
+                ))
+                conn.commit()
+                print("[MIGRATE] Colonne 'source' ajoutée à bot_stats")
+            else:
+                print("[MIGRATE] Colonne 'source' déjà présente")
+    except Exception as e:
+        print(f"[MIGRATE] {e}")
+
+with app.app_context():
+    auto_migrate()
 
 # ─── BOOT ────────────────────────────────────────────────────────────
 
