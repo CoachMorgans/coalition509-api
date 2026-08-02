@@ -127,7 +127,7 @@ def admin_required(f):
 
 def build_bot_stats_response():
     """Construit la réponse {latest, week} attendue par le frontend.
-    Agrège les stats de TOUS les bots (sources) par SUM."""
+    Agrège par SUM toutes les sources (legacy + nouvelles)."""
     today = datetime.date.today()
     week_ago = today - datetime.timedelta(days=6)
 
@@ -139,11 +139,10 @@ def build_bot_stats_response():
             "conversations": sum(r.messages_received or 0 for r in latest_rows),
             "messages": sum((r.messages_sent or 0) + (r.messages_received or 0) for r in latest_rows),
             "conversions": sum(r.conversions or 0 for r in latest_rows),
-            "active": 0,
+            "active": sum(r.messages_received or 0 for r in latest_rows),  # v2.8.1
             "date": today.isoformat()
         }
     else:
-        # Fallback sur BotMessage (24h)
         since = datetime.datetime.utcnow() - datetime.timedelta(days=1)
         msgs_today = BotMessage.query.filter(BotMessage.created_at >= since).all()
         total_msgs = len(msgs_today)
@@ -153,7 +152,7 @@ def build_bot_stats_response():
             "conversations": total_msgs,
             "messages": total_msgs,
             "conversions": 0,
-            "active": 0,
+            "active": total_msgs,
             "date": today.isoformat()
         }
 
@@ -171,7 +170,6 @@ def build_bot_stats_response():
         by_day[d]["messages"] += (r.messages_sent or 0) + (r.messages_received or 0)
         by_day[d]["conversions"] += r.conversions or 0
 
-    # Fallback BotMessage si aucune donnée BotStat
     if not by_day:
         since = datetime.datetime.utcnow() - datetime.timedelta(days=7)
         msgs = BotMessage.query.filter(BotMessage.created_at >= since).all()
@@ -182,7 +180,6 @@ def build_bot_stats_response():
             by_day[day]["messages"] += 1
             by_day[day]["conversations"] += 1
 
-    # Remplir les 7 jours
     week = []
     for i in range(7):
         d = (week_ago + datetime.timedelta(days=i)).strftime("%Y-%m-%d")
@@ -548,8 +545,7 @@ def bot_stats_post():
         stat = BotStat(date=today, source=source)
         db.session.add(stat)
 
-    # max() par source : si le bot redémarre, ses compteurs ne font pas
-    # baisser la ligne des AUTRES bots. Chaque bot a sa propre ligne.
+    # max() par source : chaque bot a sa propre ligne, pas d'écrasement mutuel
     stat.unique_users = max(stat.unique_users or 0, data.get('leads', 0))
     stat.messages_received = max(stat.messages_received or 0, data.get('conversations', 0))
     stat.messages_sent = max(stat.messages_sent or 0, data.get('messages', 0))
@@ -816,13 +812,13 @@ app.register_blueprint(v1_bp)  # Alias /api/v1/*
 def index():
     return jsonify({
         'service': 'Coalition 509 API',
-        'version': '2.8.0',
+        'version': '2.8.1',
         'status': 'ok'
     })
 
 # ─── MIGRATION AUTO ──────────────────────────────────────────────────
 def auto_migrate():
-    """Ajoute la colonne source à bot_stats si elle n'existe pas (v2.8.0)."""
+    """Ajoute la colonne source à bot_stats si absente (v2.8.x)."""
     try:
         with db.engine.connect() as conn:
             result = conn.execute(db.text(
