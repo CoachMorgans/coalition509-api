@@ -1,8 +1,9 @@
 """
-Coalition 509 API — Backend v2.8.2
+Coalition 509 API — Backend v2.8.3
 Fix : Normalisation téléphone universelle (bot ↔ SaaS)
       + messages backend = messages_sent (pas sent+received)
       + verify-bot-token normalisé
+      + db.create_all() au boot pour persistance Render
 """
 
 import os
@@ -661,7 +662,7 @@ def seed():
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 # ═══════════════════════════════════════════════════════════════════
-# ALIAS /api/v1/* pour compatibilite frontend v1.5.2
+# ALIAS /api/v1/* pour compatibilite frontend v1.5.x
 # ═══════════════════════════════════════════════════════════════════
 v1_bp = Blueprint('v1', __name__, url_prefix='/api/v1')
 
@@ -798,7 +799,7 @@ app.register_blueprint(v1_bp)
 def index():
     return jsonify({
         'service': 'Coalition 509 API',
-        'version': '2.8.2',
+        'version': '2.8.3',
         'status': 'ok'
     })
 
@@ -821,6 +822,9 @@ def auto_migrate():
         print(f"[MIGRATE] {e}")
 
 with app.app_context():
+    # CREATION AUTO DES TABLES AU BOOT (persistance Render)
+    db.create_all()
+    print("[BOOT] Tables verifiees/creees")
     auto_migrate()
 
 if __name__ == '__main__':
