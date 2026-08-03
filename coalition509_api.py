@@ -1,8 +1,8 @@
 """
-Coalition 509 API — Backend v2.7.9
-Fix : GET /api/bot/stats PUBLIC (sans JWT) + POST /api/bot/stats accepte vraies stats bot
-      + route /api/bot/generate-token pour auto-auth bot
-      + modèle BotStat avec colonne conversions
+Coalition 509 API — Backend v2.8.2
+Fix : Normalisation téléphone universelle (bot ↔ SaaS)
+      + messages backend = messages_sent (pas sent+received)
+      + verify-bot-token normalisé
 """
 
 import os
@@ -10,13 +10,13 @@ import uuid
 import hashlib
 import datetime
 import time
+import re
 from functools import wraps
 
 from flask import Flask, request, jsonify, Blueprint
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 
-# ─── CONFIG ─────────────────────────────────────────────────────────
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'postgresql://localhost/coalition509')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -25,8 +25,21 @@ app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'coalition509-dev-secret
 db = SQLAlchemy(app)
 CORS(app)
 
-# ─── MODÈLES ───────────────────────────────────────────────────────
+# ─── NORMALISATION TÉLÉPHONE ──────────────────────────────────────
+def normaliser_tel(phone):
+    if not phone:
+        return ''
+    t = phone.strip()
+    t = re.sub(r"[\s\-\.\(\)]", "", t)
+    if t.startswith('+'):
+        t = '00' + t[1:]
+    if t.startswith('225') and not t.startswith('00225'):
+        t = '00' + t
+    if t.startswith('509') and not t.startswith('00509'):
+        t = '00' + t
+    return t
 
+# ─── MODÈLES ─────────────────────────────────────────────────────
 class User(db.Model):
     __tablename__ = 'users'
     id = db.Column(db.Integer, primary_key=True)
@@ -87,8 +100,7 @@ class BotStat(db.Model):
     unique_users = db.Column(db.Integer, default=0)
     conversions = db.Column(db.Integer, default=0)
 
-# ─── UTILS ───────────────────────────────────────────────────────────
-
+# ─── UTILS ─────────────────────────────────────────────────────────
 def hash_pin(pin):
     return hashlib.sha256(pin.encode()).hexdigest()
 
@@ -123,23 +135,19 @@ def admin_required(f):
         return f(*args, **kwargs)
     return decorated
 
-# ─── HELPER : STATS BOT (format frontend v1.5.2) ───────────────────
-
+# ─── HELPER : STATS BOT ────────────────────────────────────────────
 def build_bot_stats_response():
-    """Construit la réponse {latest, week} attendue par le frontend.
-    Agrège par SUM toutes les sources (legacy + nouvelles)."""
     today = datetime.date.today()
     week_ago = today - datetime.timedelta(days=6)
 
-    # ── Latest = SUM de toutes les sources aujourd'hui ──
     latest_rows = BotStat.query.filter_by(date=today).all()
     if latest_rows:
         latest = {
             "leads": sum(r.unique_users or 0 for r in latest_rows),
             "conversations": sum(r.messages_received or 0 for r in latest_rows),
-            "messages": sum((r.messages_sent or 0) + (r.messages_received or 0) for r in latest_rows),
+            "messages": sum(r.messages_sent or 0 for r in latest_rows),
             "conversions": sum(r.conversions or 0 for r in latest_rows),
-            "active": sum(r.messages_received or 0 for r in latest_rows),  # v2.8.1
+            "active": sum(r.messages_received or 0 for r in latest_rows),
             "date": today.isoformat()
         }
     else:
@@ -156,7 +164,6 @@ def build_bot_stats_response():
             "date": today.isoformat()
         }
 
-    # ── Week = agrégation par jour (SUM de toutes les sources) ──
     week_rows = BotStat.query.filter(BotStat.date >= week_ago).order_by(BotStat.date.asc()).all()
     by_day = {}
     for r in week_rows:
@@ -167,7 +174,7 @@ def build_bot_stats_response():
             by_day[d] = {"leads": 0, "conversations": 0, "messages": 0, "conversions": 0}
         by_day[d]["leads"] += r.unique_users or 0
         by_day[d]["conversations"] += r.messages_received or 0
-        by_day[d]["messages"] += (r.messages_sent or 0) + (r.messages_received or 0)
+        by_day[d]["messages"] += r.messages_sent or 0
         by_day[d]["conversions"] += r.conversions or 0
 
     if not by_day:
@@ -191,13 +198,12 @@ def build_bot_stats_response():
     return {"latest": latest, "week": week}
 
 # ─── BLUEPRINT : AUTH ──────────────────────────────────────────────
-
 auth_bp = Blueprint('auth', __name__, url_prefix='/api/auth')
 
 @auth_bp.route('/login', methods=['POST'])
 def login():
     data = request.get_json() or {}
-    phone = data.get('phone', '').strip()
+    phone = normaliser_tel(data.get('phone', ''))
     pin = data.get('pin', '').strip()
     if not phone or not pin:
         return jsonify({'status': 'error', 'message': 'Phone et PIN requis'}), 400
@@ -221,7 +227,7 @@ def login():
 @auth_bp.route('/register', methods=['POST'])
 def register():
     data = request.get_json() or {}
-    phone = data.get('phone', '').strip()
+    phone = normaliser_tel(data.get('phone', ''))
     pin = data.get('pin', '').strip()
     first_name = data.get('first_name', '').strip()
     last_name = data.get('last_name', '').strip()
@@ -272,7 +278,7 @@ def verify_bot_token():
     if not bot_token:
         return jsonify({'ok': False, 'error': 'Token manquant'}), 400
     try:
-        phone = bot_token.split('|')[0] if '|' in bot_token else bot_token
+        phone = normaliser_tel(bot_token.split('|')[0] if '|' in bot_token else bot_token)
         user = User.query.filter_by(phone=phone).first()
         if user:
             return jsonify({
@@ -291,7 +297,6 @@ def verify_bot_token():
         return jsonify({'ok': False, 'error': str(e)}), 400
 
 # ─── BLUEPRINT : USERS ─────────────────────────────────────────────
-
 users_bp = Blueprint('users', __name__, url_prefix='/api/users')
 
 @users_bp.route('', methods=['GET'])
@@ -315,7 +320,6 @@ def list_users():
     })
 
 # ─── BLUEPRINT : CAMPAIGNS ─────────────────────────────────────────
-
 campaigns_bp = Blueprint('campaigns', __name__, url_prefix='/api/campaigns')
 
 @campaigns_bp.route('', methods=['GET'])
@@ -409,8 +413,7 @@ def delete_campaign():
     db.session.commit()
     return jsonify({'status': 'success', 'message': 'Campagne supprimée'})
 
-# ─── BLUEPRINT : ORDERS ──────────────────────────────────────────────
-
+# ─── BLUEPRINT : ORDERS ────────────────────────────────────────────
 orders_bp = Blueprint('orders', __name__, url_prefix='/api/orders')
 
 @orders_bp.route('', methods=['GET'])
@@ -478,10 +481,9 @@ def pay_order():
     o.payment_method = method
     o.status = 'completed'
     db.session.commit()
-    return jsonify({'status': 'success', 'message': 'Paiement enregistré', 'order': {'id': o.id, 'payment_status': o.payment_status}})
+    return jsonify({'status': 'success', 'message': 'Paiement enregistre', 'order': {'id': o.id, 'payment_status': o.payment_status}})
 
-# ─── BLUEPRINT : STATS ─────────────────────────────────────────────
-
+# ─── BLUEPRINT : STATS ───────────────────────────────────────────
 stats_bp = Blueprint('stats', __name__, url_prefix='/api/stats')
 
 @stats_bp.route('/overview', methods=['GET'])
@@ -505,8 +507,7 @@ def stats_overview():
         }
     })
 
-# ─── BLUEPRINT : BOT ───────────────────────────────────────────────
-
+# ─── BLUEPRINT : BOT ─────────────────────────────────────────────
 bot_bp = Blueprint('bot', __name__, url_prefix='/api/bot')
 
 @bot_bp.route('/stats', methods=['GET'])
@@ -545,7 +546,6 @@ def bot_stats_post():
         stat = BotStat(date=today, source=source)
         db.session.add(stat)
 
-    # max() par source : chaque bot a sa propre ligne, pas d'écrasement mutuel
     stat.unique_users = max(stat.unique_users or 0, data.get('leads', 0))
     stat.messages_received = max(stat.messages_received or 0, data.get('conversations', 0))
     stat.messages_sent = max(stat.messages_sent or 0, data.get('messages', 0))
@@ -561,15 +561,14 @@ def generate_bot_token():
     if api_key != os.environ.get('BOT_API_KEY', 'coalition509-bot-secret-2026'):
         return jsonify({'status': 'error', 'message': 'Unauthorized'}), 401
     data = request.get_json() or {}
-    phone = data.get('phone', '').strip()
+    phone = normaliser_tel(data.get('phone', ''))
     if not phone:
         return jsonify({'status': 'error', 'message': 'Phone requis'}), 400
     token_raw = f"{phone}|{int(time.time())}|{app.config['SECRET_KEY']}"
     token = hashlib.sha256(token_raw.encode()).hexdigest()[:32]
     return jsonify({'token': f"{phone}|{token}"})
 
-# ─── BLUEPRINT : INIT-DB ───────────────────────────────────────────
-
+# ─── BLUEPRINT : INIT-DB ─────────────────────────────────────────
 init_bp = Blueprint('init', __name__, url_prefix='/api')
 
 @init_bp.route('/init-db', methods=['GET'])
@@ -584,8 +583,7 @@ def init_db():
         db.session.rollback()
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-# ─── BLUEPRINT : SEED ──────────────────────────────────────────────
-
+# ─── BLUEPRINT : SEED ────────────────────────────────────────────
 seed_bp = Blueprint('seed', __name__, url_prefix='/api')
 
 @seed_bp.route('/seed', methods=['GET', 'POST'])
@@ -599,13 +597,13 @@ def seed():
         db.session.commit()
 
         u1 = User(
-            phone='50912345678', pin_hash=hash_pin('1234'),
+            phone='0050912345678', pin_hash=hash_pin('1234'),
             first_name='Jean', last_name='Pierre', email='jean@coalition509.ht',
             role='user', status='active', region='Ouest', commune='Port-au-Prince',
             profile_type='Animateur NGD', ngd_id=generate_ngd_id()
         )
         u2 = User(
-            phone='50987654321', pin_hash=hash_pin('1234'),
+            phone='0050987654321', pin_hash=hash_pin('1234'),
             first_name='Marie', last_name='Joseph', email='marie@coalition509.ht',
             role='admin', status='active', region='Nord', commune='Cap-Haitien',
             profile_type='Superviseur', ngd_id=generate_ngd_id()
@@ -651,7 +649,7 @@ def seed():
 
         for i in range(3):
             m = BotMessage(
-                phone='50912345678', message=f'Message test {i+1}',
+                phone='0050912345678', message=f'Message test {i+1}',
                 direction='in' if i % 2 == 0 else 'out'
             )
             db.session.add(m)
@@ -665,10 +663,8 @@ def seed():
 # ═══════════════════════════════════════════════════════════════════
 # ALIAS /api/v1/* pour compatibilite frontend v1.5.2
 # ═══════════════════════════════════════════════════════════════════
-
 v1_bp = Blueprint('v1', __name__, url_prefix='/api/v1')
 
-# Auth aliases
 @v1_bp.route('/auth/login', methods=['POST'])
 def v1_login():
     return login()
@@ -686,7 +682,6 @@ def v1_me():
 def v1_verify_bot_token():
     return verify_bot_token()
 
-# Dashboard stats alias
 @v1_bp.route('/dashboard/stats', methods=['GET'])
 @token_required
 def v1_dashboard_stats():
@@ -707,7 +702,6 @@ def v1_dashboard_stats():
         'pending_withdrawals': 0
     })
 
-# Campaigns aliases
 @v1_bp.route('/campaigns', methods=['GET'])
 @token_required
 def v1_list_campaigns():
@@ -718,19 +712,16 @@ def v1_list_campaigns():
 def v1_create_campaign():
     return create_campaign()
 
-# Users alias
 @v1_bp.route('/users', methods=['GET'])
 @token_required
 def v1_list_users():
     return list_users()
 
-# Orders alias
 @v1_bp.route('/orders', methods=['GET'])
 @token_required
 def v1_list_orders():
     return list_orders()
 
-# Payments alias (map vers orders/pay)
 @v1_bp.route('/payments/init', methods=['POST'])
 @token_required
 def v1_payments_init():
@@ -742,7 +733,6 @@ def v1_payments_confirm():
     data = request.get_json() or {}
     return jsonify({'ok': True, 'status': 'confirmed', 'payment_id': data.get('payment_id')})
 
-# Export alias
 @v1_bp.route('/export/users', methods=['GET'])
 @token_required
 def v1_export_users():
@@ -782,7 +772,6 @@ def v1_export_campaigns():
     from flask import Response
     return Response(output.getvalue(), mimetype='text/csv', headers={'Content-Disposition': 'attachment; filename=campaigns.csv'})
 
-# Bot aliases — FIX v2.7.9 : GET public (sans JWT), même format {latest, week}
 @v1_bp.route('/bot/stats', methods=['GET'])
 def v1_bot_stats():
     return jsonify(build_bot_stats_response())
@@ -795,7 +784,6 @@ def v1_bot_stats_history():
 # ═══════════════════════════════════════════════════════════════════
 # ENREGISTREMENT DES BLUEPRINTS
 # ═══════════════════════════════════════════════════════════════════
-
 app.register_blueprint(auth_bp)
 app.register_blueprint(users_bp)
 app.register_blueprint(campaigns_bp)
@@ -804,21 +792,17 @@ app.register_blueprint(stats_bp)
 app.register_blueprint(bot_bp)
 app.register_blueprint(init_bp)
 app.register_blueprint(seed_bp)
-app.register_blueprint(v1_bp)  # Alias /api/v1/*
-
-# ─── ROUTE RACINE ──────────────────────────────────────────────────
+app.register_blueprint(v1_bp)
 
 @app.route('/')
 def index():
     return jsonify({
         'service': 'Coalition 509 API',
-        'version': '2.8.1',
+        'version': '2.8.2',
         'status': 'ok'
     })
 
-# ─── MIGRATION AUTO ──────────────────────────────────────────────────
 def auto_migrate():
-    """Ajoute la colonne source à bot_stats si absente (v2.8.x)."""
     try:
         with db.engine.connect() as conn:
             result = conn.execute(db.text(
@@ -830,16 +814,14 @@ def auto_migrate():
                     "ALTER TABLE bot_stats ADD COLUMN source VARCHAR(50) DEFAULT 'unknown'"
                 ))
                 conn.commit()
-                print("[MIGRATE] Colonne 'source' ajoutée à bot_stats")
+                print("[MIGRATE] Colonne 'source' ajoutee a bot_stats")
             else:
-                print("[MIGRATE] Colonne 'source' déjà présente")
+                print("[MIGRATE] Colonne 'source' deja presente")
     except Exception as e:
         print(f"[MIGRATE] {e}")
 
 with app.app_context():
     auto_migrate()
-
-# ─── BOOT ────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
