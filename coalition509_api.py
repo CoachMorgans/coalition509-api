@@ -1,8 +1,9 @@
 """
-Coalition 509 API — Backend v2.8.4
+Coalition 509 API — Backend v2.8.5
 Fix : Normalisation téléphone universelle (bot ↔ SaaS)
       + db.create_all() au boot pour persistance Render
       + access_token dans réponse register (auto-login après inscription)
+      + BUGFIX : u.profile_type → user.profile_type dans verify_bot_token
 """
 
 import os
@@ -290,7 +291,7 @@ def verify_bot_token():
                     'id': user.id, 'phone': user.phone, 'first_name': user.first_name,
                     'last_name': user.last_name, 'email': user.email, 'role': user.role,
                     'region': user.region, 'commune': user.commune,
-                    'profile_type': u.profile_type, 'ngd_id': user.ngd_id
+                    'profile_type': user.profile_type, 'ngd_id': user.ngd_id
                 }
             })
         else:
@@ -800,7 +801,7 @@ app.register_blueprint(v1_bp)
 def index():
     return jsonify({
         'service': 'Coalition 509 API',
-        'version': '2.8.4',
+        'version': '2.8.5',
         'status': 'ok'
     })
 
