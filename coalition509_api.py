@@ -1,9 +1,8 @@
 """
-Coalition 509 API — Backend v2.8.3
+Coalition 509 API — Backend v2.8.4
 Fix : Normalisation téléphone universelle (bot ↔ SaaS)
-      + messages backend = messages_sent (pas sent+received)
-      + verify-bot-token normalisé
       + db.create_all() au boot pour persistance Render
+      + access_token dans réponse register (auto-login après inscription)
 """
 
 import os
@@ -248,6 +247,8 @@ def register():
     db.session.commit()
     return jsonify({
         'status': 'success',
+        'token': user.phone,
+        'access_token': user.phone,
         'id': user.id,
         'ngd_id': user.ngd_id,
         'user': {
@@ -289,7 +290,7 @@ def verify_bot_token():
                     'id': user.id, 'phone': user.phone, 'first_name': user.first_name,
                     'last_name': user.last_name, 'email': user.email, 'role': user.role,
                     'region': user.region, 'commune': user.commune,
-                    'profile_type': user.profile_type, 'ngd_id': user.ngd_id
+                    'profile_type': u.profile_type, 'ngd_id': user.ngd_id
                 }
             })
         else:
@@ -799,7 +800,7 @@ app.register_blueprint(v1_bp)
 def index():
     return jsonify({
         'service': 'Coalition 509 API',
-        'version': '2.8.3',
+        'version': '2.8.4',
         'status': 'ok'
     })
 
@@ -822,7 +823,6 @@ def auto_migrate():
         print(f"[MIGRATE] {e}")
 
 with app.app_context():
-    # CREATION AUTO DES TABLES AU BOOT (persistance Render)
     db.create_all()
     print("[BOOT] Tables verifiees/creees")
     auto_migrate()
