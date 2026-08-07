@@ -1,9 +1,9 @@
 """
-Coalition 509 API — Backend v2.8.5
+Coalition 509 API — Backend v2.8.6
 Fix : Normalisation téléphone universelle (bot ↔ SaaS)
       + db.create_all() au boot pour persistance Render
       + access_token dans réponse register (auto-login après inscription)
-      + BUGFIX : u.profile_type → user.profile_type dans verify_bot_token
+      + BUGFIX v2.8.6 : u.profile_type → user.profile_type dans verify_bot_token
 """
 
 import os
@@ -114,18 +114,24 @@ def generate_order_number():
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        token = None
-        if 'Authorization' in request.headers:
-            parts = request.headers['Authorization'].split()
-            if len(parts) == 2 and parts[0] == 'Bearer':
-                token = parts[1]
-        if not token:
-            return jsonify({'status': 'error', 'message': 'Token manquant'}), 401
-        user = User.query.filter_by(phone=token).first()
-        if not user:
-            return jsonify({'status': 'error', 'message': 'Token invalide'}), 401
-        request.current_user = user
-        return f(*args, **kwargs)
+        try:
+            token = None
+            if 'Authorization' in request.headers:
+                parts = request.headers['Authorization'].split()
+                if len(parts) == 2 and parts[0] == 'Bearer':
+                    token = parts[1]
+            if not token:
+                return jsonify({'status': 'error', 'message': 'Token manquant'}), 401
+            user = User.query.filter_by(phone=token).first()
+            if not user:
+                return jsonify({'status': 'error', 'message': 'Token invalide'}), 401
+            request.current_user = user
+            return f(*args, **kwargs)
+        except Exception as e:
+            import traceback
+            print(f"[ERROR token_required] {e}")
+            traceback.print_exc()
+            return jsonify({'status': 'error', 'message': f'Server error: {str(e)}'}), 500
     return decorated
 
 def admin_required(f):
@@ -801,7 +807,7 @@ app.register_blueprint(v1_bp)
 def index():
     return jsonify({
         'service': 'Coalition 509 API',
-        'version': '2.8.5',
+        'version': '2.8.6',
         'status': 'ok'
     })
 
