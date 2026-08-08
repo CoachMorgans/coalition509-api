@@ -1,11 +1,9 @@
 """
-Coalition 509 API — Backend v2.8.7
-Fix : pool_pre_ping + pool_recycle pour stabilité SSL Supabase/Render
-      + init-db doux (drop_all/create_all au lieu de DROP SCHEMA CASCADE)
-      + stats bot wrapped try/except pour jamais crasher le dashboard
-      + verify_bot_token robuste avec rollback auto
+Coalition 509 API — Backend v2.9.0
+Module SHOP intégré : Produits, Panier, Commandes, Fournisseurs, Livraisons, Paiements, Factures, Stocks
+Fix : pool_pre_ping + pool_recycle, init-db doux, stats bot wrapped, verify_bot_token robuste
+RÈGLE D'OR : pas de chevrons <> dans les routes Flask — query params uniquement
 """
-
 
 import os, uuid, hashlib, datetime, time, re
 from functools import wraps
@@ -30,6 +28,9 @@ def normaliser_tel(phone):
     if t.startswith('509') and not t.startswith('00509'): t = '00' + t
     return t
 
+# ============================================================
+# MODÈLES EXISTANTS
+# ============================================================
 class User(db.Model):
     __tablename__ = 'users'
     id = db.Column(db.Integer, primary_key=True)
@@ -90,9 +91,93 @@ class BotStat(db.Model):
     unique_users = db.Column(db.Integer, default=0)
     conversions = db.Column(db.Integer, default=0)
 
+# ============================================================
+# MODÈLES SHOP
+# ============================================================
+class Product(db.Model):
+    __tablename__ = 'products'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(200), nullable=False)
+    description = db.Column(db.Text)
+    category = db.Column(db.String(50), default='general')
+    price = db.Column(db.Numeric(12, 2), default=0)
+    stock_quantity = db.Column(db.Integer, default=0)
+    supplier_id = db.Column(db.Integer, db.ForeignKey('suppliers.id'))
+    status = db.Column(db.String(20), default='active')
+    image_url = db.Column(db.String(500))
+    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+
+class CartItem(db.Model):
+    __tablename__ = 'cart_items'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    product_id = db.Column(db.Integer, db.ForeignKey('products.id'), nullable=False)
+    quantity = db.Column(db.Integer, default=1)
+    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+
+class OrderItem(db.Model):
+    __tablename__ = 'order_items'
+    id = db.Column(db.Integer, primary_key=True)
+    order_id = db.Column(db.Integer, db.ForeignKey('orders.id'), nullable=False)
+    product_id = db.Column(db.Integer, db.ForeignKey('products.id'), nullable=False)
+    quantity = db.Column(db.Integer, default=1)
+    unit_price = db.Column(db.Numeric(12, 2), default=0)
+    total_price = db.Column(db.Numeric(12, 2), default=0)
+
+class Supplier(db.Model):
+    __tablename__ = 'suppliers'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(200), nullable=False)
+    contact_name = db.Column(db.String(100))
+    phone = db.Column(db.String(20))
+    email = db.Column(db.String(120))
+    region = db.Column(db.String(50))
+    commune = db.Column(db.String(50))
+    address = db.Column(db.Text)
+    status = db.Column(db.String(20), default='active')
+    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+
+class Delivery(db.Model):
+    __tablename__ = 'deliveries'
+    id = db.Column(db.Integer, primary_key=True)
+    order_id = db.Column(db.Integer, db.ForeignKey('orders.id'), nullable=False)
+    status = db.Column(db.String(20), default='pending')
+    tracking_number = db.Column(db.String(100))
+    address = db.Column(db.Text)
+    region = db.Column(db.String(50))
+    commune = db.Column(db.String(50))
+    estimated_date = db.Column(db.Date)
+    delivered_at = db.Column(db.DateTime)
+    notes = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+
+class Invoice(db.Model):
+    __tablename__ = 'invoices'
+    id = db.Column(db.Integer, primary_key=True)
+    order_id = db.Column(db.Integer, db.ForeignKey('orders.id'), nullable=False)
+    invoice_number = db.Column(db.String(50), unique=True, nullable=False)
+    amount = db.Column(db.Numeric(12, 2), default=0)
+    status = db.Column(db.String(20), default='pending')
+    issued_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    paid_at = db.Column(db.DateTime)
+    due_date = db.Column(db.Date)
+
+class StockMovement(db.Model):
+    __tablename__ = 'stock_movements'
+    id = db.Column(db.Integer, primary_key=True)
+    product_id = db.Column(db.Integer, db.ForeignKey('products.id'), nullable=False)
+    movement_type = db.Column(db.String(20), default='in')
+    quantity = db.Column(db.Integer, default=0)
+    reason = db.Column(db.String(200))
+    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+
+# ============================================================
+# UTILITAIRES
+# ============================================================
 def hash_pin(pin): return hashlib.sha256(pin.encode()).hexdigest()
 def generate_ngd_id(): return f"NGD-{datetime.datetime.now().year}-{uuid.uuid4().hex[:6].upper()}"
 def generate_order_number(): return f"CMD-{str(uuid.uuid4().int % 10000).zfill(3)}"
+def generate_invoice_number(): return f"FAC-{datetime.datetime.now().year}-{str(uuid.uuid4().int % 10000).zfill(4)}"
 
 def token_required(f):
     @wraps(f)
@@ -166,6 +251,9 @@ def build_bot_stats_response():
         week = [{"date":(week_ago + datetime.timedelta(days=i)).strftime("%Y-%m-%d"),"leads":0,"conversations":0,"messages":0,"conversions":0} for i in range(7)]
         return {"latest":{"leads":0,"conversations":0,"messages":0,"conversions":0,"active":0,"date":today.isoformat()}, "week":week}
 
+# ============================================================
+# BLUEPRINT : AUTH
+# ============================================================
 auth_bp = Blueprint('auth', __name__, url_prefix='/api/auth')
 
 @auth_bp.route('/login', methods=['POST'])
@@ -223,6 +311,9 @@ def verify_bot_token():
         db.session.rollback()
         return jsonify({'ok':False,'error':str(e)}), 400
 
+# ============================================================
+# BLUEPRINT : USERS
+# ============================================================
 users_bp = Blueprint('users', __name__, url_prefix='/api/users')
 
 @users_bp.route('', methods=['GET'])
@@ -235,6 +326,9 @@ def list_users():
     users = q.offset((page-1)*per_page).limit(per_page).all()
     return jsonify({'status':'success','page':page,'per_page':per_page,'total':total,'users':[{'id':u.id,'phone':u.phone,'first_name':u.first_name,'last_name':u.last_name,'email':u.email,'role':u.role,'status':u.status,'region':u.region,'commune':u.commune,'profile_type':u.profile_type,'ngd_id':u.ngd_id,'created_at':u.created_at.isoformat() if u.created_at else None} for u in users]})
 
+# ============================================================
+# BLUEPRINT : CAMPAIGNS
+# ============================================================
 campaigns_bp = Blueprint('campaigns', __name__, url_prefix='/api/campaigns')
 
 @campaigns_bp.route('', methods=['GET'])
@@ -292,6 +386,9 @@ def delete_campaign():
     db.session.delete(c); db.session.commit()
     return jsonify({'status':'success','message':'Campagne supprimée'})
 
+# ============================================================
+# BLUEPRINT : ORDERS (legacy TCL)
+# ============================================================
 orders_bp = Blueprint('orders', __name__, url_prefix='/api/orders')
 
 @orders_bp.route('', methods=['GET'])
@@ -316,7 +413,12 @@ def get_order():
     o = Order.query.get(oid)
     if not o: return jsonify({'status':'error','message':'Commande introuvable'}), 404
     u = User.query.get(o.user_id)
-    return jsonify({'status':'success','order':{'id':o.id,'order_number':o.order_number,'total_amount':float(o.total_amount) if o.total_amount else 0,'status':o.status,'payment_status':o.payment_status,'payment_method':o.payment_method,'region':o.region,'commune':o.commune,'created_at':o.created_at.isoformat() if o.created_at else None,'user':{'id':u.id,'phone':u.phone,'first_name':u.first_name,'last_name':u.last_name} if u else None}})
+    items = OrderItem.query.filter_by(order_id=o.id).all()
+    items_out = []
+    for it in items:
+        p = Product.query.get(it.product_id)
+        items_out.append({'id':it.id,'product_id':it.product_id,'product_name':p.name if p else '—','quantity':it.quantity,'unit_price':float(it.unit_price),'total_price':float(it.total_price)})
+    return jsonify({'status':'success','order':{'id':o.id,'order_number':o.order_number,'total_amount':float(o.total_amount) if o.total_amount else 0,'status':o.status,'payment_status':o.payment_status,'payment_method':o.payment_method,'region':o.region,'commune':o.commune,'created_at':o.created_at.isoformat() if o.created_at else None,'user':{'id':u.id,'phone':u.phone,'first_name':u.first_name,'last_name':u.last_name} if u else None,'items':items_out}})
 
 @orders_bp.route('/pay', methods=['POST'])
 @token_required
@@ -331,17 +433,443 @@ def pay_order():
     db.session.commit()
     return jsonify({'status':'success','message':'Paiement enregistre','order':{'id':o.id,'payment_status':o.payment_status}})
 
+# ============================================================
+# BLUEPRINT : SHOP (module COMMANDES complet)
+# ============================================================
+shop_bp = Blueprint('shop', __name__, url_prefix='/api/shop')
+
+# —— PRODUITS ——
+@shop_bp.route('/products', methods=['GET'])
+@token_required
+def shop_list_products():
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 20, type=int)
+    cat = request.args.get('category', '')
+    q = Product.query
+    if cat: q = q.filter_by(category=cat)
+    q = q.order_by(Product.created_at.desc())
+    total = q.count()
+    products = q.offset((page-1)*per_page).limit(per_page).all()
+    return jsonify({'status':'success','page':page,'per_page':per_page,'total':total,'products':[{'id':p.id,'name':p.name,'description':p.description,'category':p.category,'price':float(p.price),'stock_quantity':p.stock_quantity,'supplier_id':p.supplier_id,'status':p.status,'image_url':p.image_url,'created_at':p.created_at.isoformat() if p.created_at else None} for p in products]})
+
+@shop_bp.route('/products', methods=['POST'])
+@token_required
+@admin_required
+def shop_create_product():
+    data = request.get_json() or {}
+    p = Product(name=data.get('name',''), description=data.get('description',''), category=data.get('category','general'),
+                price=data.get('price',0), stock_quantity=data.get('stock_quantity',0), supplier_id=data.get('supplier_id'),
+                status=data.get('status','active'), image_url=data.get('image_url',''))
+    db.session.add(p); db.session.commit()
+    return jsonify({'status':'success','product':{'id':p.id,'name':p.name}}), 201
+
+@shop_bp.route('/products/detail', methods=['GET'])
+@token_required
+def shop_get_product():
+    pid = request.args.get('id', type=int)
+    if not pid: return jsonify({'status':'error','message':'id requis'}), 400
+    p = Product.query.get(pid)
+    if not p: return jsonify({'status':'error','message':'Produit introuvable'}), 404
+    return jsonify({'status':'success','product':{'id':p.id,'name':p.name,'description':p.description,'category':p.category,'price':float(p.price),'stock_quantity':p.stock_quantity,'supplier_id':p.supplier_id,'status':p.status,'image_url':p.image_url}})
+
+@shop_bp.route('/products/update', methods=['POST'])
+@token_required
+@admin_required
+def shop_update_product():
+    data = request.get_json() or {}
+    pid = data.get('id')
+    if not pid: return jsonify({'status':'error','message':'id requis'}), 400
+    p = Product.query.get(pid)
+    if not p: return jsonify({'status':'error','message':'Produit introuvable'}), 404
+    p.name = data.get('name', p.name); p.description = data.get('description', p.description)
+    p.category = data.get('category', p.category); p.price = data.get('price', p.price)
+    p.stock_quantity = data.get('stock_quantity', p.stock_quantity); p.supplier_id = data.get('supplier_id', p.supplier_id)
+    p.status = data.get('status', p.status); p.image_url = data.get('image_url', p.image_url)
+    db.session.commit()
+    return jsonify({'status':'success','product':{'id':p.id,'name':p.name}})
+
+@shop_bp.route('/products/delete', methods=['POST'])
+@token_required
+@admin_required
+def shop_delete_product():
+    data = request.get_json() or {}
+    pid = data.get('id')
+    if not pid: return jsonify({'status':'error','message':'id requis'}), 400
+    p = Product.query.get(pid)
+    if not p: return jsonify({'status':'error','message':'Produit introuvable'}), 404
+    db.session.delete(p); db.session.commit()
+    return jsonify({'status':'success','message':'Produit supprimé'})
+
+# —— PANIER ——
+@shop_bp.route('/cart', methods=['GET'])
+@token_required
+def shop_get_cart():
+    user_id = request.current_user.id
+    items = CartItem.query.filter_by(user_id=user_id).all()
+    result = []
+    total = 0
+    for it in items:
+        p = Product.query.get(it.product_id)
+        if p:
+            sub = float(p.price) * it.quantity
+            total += sub
+            result.append({'id':it.id,'product_id':p.id,'name':p.name,'price':float(p.price),'quantity':it.quantity,'subtotal':sub,'image_url':p.image_url})
+    return jsonify({'status':'success','items':result,'total':total,'count':len(result)})
+
+@shop_bp.route('/cart/add', methods=['POST'])
+@token_required
+def shop_add_cart():
+    data = request.get_json() or {}
+    user_id = request.current_user.id
+    product_id = data.get('product_id')
+    qty = data.get('quantity', 1)
+    if not product_id: return jsonify({'status':'error','message':'product_id requis'}), 400
+    existing = CartItem.query.filter_by(user_id=user_id, product_id=product_id).first()
+    if existing:
+        existing.quantity += qty
+    else:
+        db.session.add(CartItem(user_id=user_id, product_id=product_id, quantity=qty))
+    db.session.commit()
+    return jsonify({'status':'success','message':'Ajouté au panier'})
+
+@shop_bp.route('/cart/remove', methods=['POST'])
+@token_required
+def shop_remove_cart():
+    data = request.get_json() or {}
+    cid = data.get('id')
+    if not cid: return jsonify({'status':'error','message':'id requis'}), 400
+    item = CartItem.query.get(cid)
+    if item and item.user_id == request.current_user.id:
+        db.session.delete(item); db.session.commit()
+    return jsonify({'status':'success','message':'Retiré du panier'})
+
+@shop_bp.route('/cart/clear', methods=['POST'])
+@token_required
+def shop_clear_cart():
+    CartItem.query.filter_by(user_id=request.current_user.id).delete()
+    db.session.commit()
+    return jsonify({'status':'success','message':'Panier vidé'})
+
+# —— COMMANDES SHOP ——
+@shop_bp.route('/orders', methods=['GET'])
+@token_required
+def shop_list_orders():
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 10, type=int)
+    q = Order.query.order_by(Order.created_at.desc())
+    total = q.count()
+    orders = q.offset((page-1)*per_page).limit(per_page).all()
+    result = []
+    for o in orders:
+        u = User.query.get(o.user_id)
+        items = OrderItem.query.filter_by(order_id=o.id).all()
+        items_out = []
+        for it in items:
+            p = Product.query.get(it.product_id)
+            items_out.append({'id':it.id,'product_name':p.name if p else '—','quantity':it.quantity,'unit_price':float(it.unit_price),'total_price':float(it.total_price)})
+        result.append({'id':o.id,'order_number':o.order_number,'total_amount':float(o.total_amount) if o.total_amount else 0,'status':o.status,'payment_status':o.payment_status,'payment_method':o.payment_method,'region':o.region,'commune':o.commune,'created_at':o.created_at.isoformat() if o.created_at else None,'user':{'id':u.id,'phone':u.phone,'first_name':u.first_name,'last_name':u.last_name} if u else None,'items':items_out})
+    return jsonify({'status':'success','page':page,'per_page':per_page,'total':total,'orders':result})
+
+@shop_bp.route('/orders/create', methods=['POST'])
+@token_required
+def shop_create_order():
+    user_id = request.current_user.id
+    data = request.get_json() or {}
+    cart_items = CartItem.query.filter_by(user_id=user_id).all()
+    if not cart_items:
+        return jsonify({'status':'error','message':'Panier vide'}), 400
+    total = 0
+    order = Order(order_number=generate_order_number(), user_id=user_id, total_amount=0,
+                  status='pending', payment_status='pending', region=data.get('region',''), commune=data.get('commune',''))
+    db.session.add(order); db.session.commit()
+    for ci in cart_items:
+        p = Product.query.get(ci.product_id)
+        if not p: continue
+        sub = float(p.price) * ci.quantity
+        total += sub
+        db.session.add(OrderItem(order_id=order.id, product_id=p.id, quantity=ci.quantity, unit_price=p.price, total_price=sub))
+        p.stock_quantity = max(0, (p.stock_quantity or 0) - ci.quantity)
+        db.session.add(StockMovement(product_id=p.id, movement_type='out', quantity=ci.quantity, reason=f'Commande {order.order_number}'))
+    order.total_amount = total
+    CartItem.query.filter_by(user_id=user_id).delete()
+    db.session.commit()
+    return jsonify({'status':'success','order':{'id':order.id,'order_number':order.order_number,'total_amount':total}}), 201
+
+@shop_bp.route('/orders/detail', methods=['GET'])
+@token_required
+def shop_get_order():
+    oid = request.args.get('id', type=int)
+    if not oid: return jsonify({'status':'error','message':'id requis'}), 400
+    o = Order.query.get(oid)
+    if not o: return jsonify({'status':'error','message':'Commande introuvable'}), 404
+    u = User.query.get(o.user_id)
+    items = OrderItem.query.filter_by(order_id=o.id).all()
+    items_out = []
+    for it in items:
+        p = Product.query.get(it.product_id)
+        items_out.append({'id':it.id,'product_name':p.name if p else '—','quantity':it.quantity,'unit_price':float(it.unit_price),'total_price':float(it.total_price)})
+    inv = Invoice.query.filter_by(order_id=o.id).first()
+    delivery = Delivery.query.filter_by(order_id=o.id).first()
+    return jsonify({'status':'success','order':{'id':o.id,'order_number':o.order_number,'total_amount':float(o.total_amount) if o.total_amount else 0,'status':o.status,'payment_status':o.payment_status,'payment_method':o.payment_method,'region':o.region,'commune':o.commune,'created_at':o.created_at.isoformat() if o.created_at else None,'user':{'id':u.id,'phone':u.phone,'first_name':u.first_name,'last_name':u.last_name} if u else None,'items':items_out,'invoice':{'id':inv.id,'invoice_number':inv.invoice_number,'amount':float(inv.amount),'status':inv.status} if inv else None,'delivery':{'id':delivery.id,'status':delivery.status,'tracking_number':delivery.tracking_number,'estimated_date':str(delivery.estimated_date) if delivery.estimated_date else None} if delivery else None}})
+
+@shop_bp.route('/orders/update', methods=['POST'])
+@token_required
+@admin_required
+def shop_update_order():
+    data = request.get_json() or {}
+    oid = data.get('id')
+    if not oid: return jsonify({'status':'error','message':'id requis'}), 400
+    o = Order.query.get(oid)
+    if not o: return jsonify({'status':'error','message':'Commande introuvable'}), 404
+    o.status = data.get('status', o.status); o.payment_status = data.get('payment_status', o.payment_status)
+    o.payment_method = data.get('payment_method', o.payment_method)
+    db.session.commit()
+    return jsonify({'status':'success','order':{'id':o.id,'status':o.status}})
+
+@shop_bp.route('/orders/delete', methods=['POST'])
+@token_required
+@admin_required
+def shop_delete_order():
+    data = request.get_json() or {}
+    oid = data.get('id')
+    if not oid: return jsonify({'status':'error','message':'id requis'}), 400
+    o = Order.query.get(oid)
+    if not o: return jsonify({'status':'error','message':'Commande introuvable'}), 404
+    OrderItem.query.filter_by(order_id=o.id).delete()
+    Delivery.query.filter_by(order_id=o.id).delete()
+    Invoice.query.filter_by(order_id=o.id).delete()
+    db.session.delete(o); db.session.commit()
+    return jsonify({'status':'success','message':'Commande supprimée'})
+
+# —— FOURNISSEURS ——
+@shop_bp.route('/suppliers', methods=['GET'])
+@token_required
+def shop_list_suppliers():
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 10, type=int)
+    q = Supplier.query.order_by(Supplier.created_at.desc())
+    total = q.count()
+    suppliers = q.offset((page-1)*per_page).limit(per_page).all()
+    return jsonify({'status':'success','page':page,'per_page':per_page,'total':total,'suppliers':[{'id':s.id,'name':s.name,'contact_name':s.contact_name,'phone':s.phone,'email':s.email,'region':s.region,'commune':s.commune,'address':s.address,'status':s.status,'created_at':s.created_at.isoformat() if s.created_at else None} for s in suppliers]})
+
+@shop_bp.route('/suppliers', methods=['POST'])
+@token_required
+@admin_required
+def shop_create_supplier():
+    data = request.get_json() or {}
+    s = Supplier(name=data.get('name',''), contact_name=data.get('contact_name',''), phone=data.get('phone',''),
+                 email=data.get('email',''), region=data.get('region',''), commune=data.get('commune',''),
+                 address=data.get('address',''), status=data.get('status','active'))
+    db.session.add(s); db.session.commit()
+    return jsonify({'status':'success','supplier':{'id':s.id,'name':s.name}}), 201
+
+@shop_bp.route('/suppliers/detail', methods=['GET'])
+@token_required
+def shop_get_supplier():
+    sid = request.args.get('id', type=int)
+    if not sid: return jsonify({'status':'error','message':'id requis'}), 400
+    s = Supplier.query.get(sid)
+    if not s: return jsonify({'status':'error','message':'Fournisseur introuvable'}), 404
+    return jsonify({'status':'success','supplier':{'id':s.id,'name':s.name,'contact_name':s.contact_name,'phone':s.phone,'email':s.email,'region':s.region,'commune':s.commune,'address':s.address,'status':s.status}})
+
+@shop_bp.route('/suppliers/update', methods=['POST'])
+@token_required
+@admin_required
+def shop_update_supplier():
+    data = request.get_json() or {}
+    sid = data.get('id')
+    if not sid: return jsonify({'status':'error','message':'id requis'}), 400
+    s = Supplier.query.get(sid)
+    if not s: return jsonify({'status':'error','message':'Fournisseur introuvable'}), 404
+    s.name = data.get('name', s.name); s.contact_name = data.get('contact_name', s.contact_name)
+    s.phone = data.get('phone', s.phone); s.email = data.get('email', s.email)
+    s.region = data.get('region', s.region); s.commune = data.get('commune', s.commune)
+    s.address = data.get('address', s.address); s.status = data.get('status', s.status)
+    db.session.commit()
+    return jsonify({'status':'success','supplier':{'id':s.id,'name':s.name}})
+
+@shop_bp.route('/suppliers/delete', methods=['POST'])
+@token_required
+@admin_required
+def shop_delete_supplier():
+    data = request.get_json() or {}
+    sid = data.get('id')
+    if not sid: return jsonify({'status':'error','message':'id requis'}), 400
+    s = Supplier.query.get(sid)
+    if not s: return jsonify({'status':'error','message':'Fournisseur introuvable'}), 404
+    db.session.delete(s); db.session.commit()
+    return jsonify({'status':'success','message':'Fournisseur supprimé'})
+
+# —— LIVRAISONS ——
+@shop_bp.route('/deliveries', methods=['GET'])
+@token_required
+def shop_list_deliveries():
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 10, type=int)
+    q = Delivery.query.order_by(Delivery.created_at.desc())
+    total = q.count()
+    deliveries = q.offset((page-1)*per_page).limit(per_page).all()
+    result = []
+    for d in deliveries:
+        o = Order.query.get(d.order_id)
+        result.append({'id':d.id,'order_id':d.order_id,'order_number':o.order_number if o else '—','status':d.status,'tracking_number':d.tracking_number,'address':d.address,'region':d.region,'commune':d.commune,'estimated_date':str(d.estimated_date) if d.estimated_date else None,'delivered_at':d.delivered_at.isoformat() if d.delivered_at else None,'notes':d.notes,'created_at':d.created_at.isoformat() if d.created_at else None})
+    return jsonify({'status':'success','page':page,'per_page':per_page,'total':total,'deliveries':result})
+
+@shop_bp.route('/deliveries', methods=['POST'])
+@token_required
+@admin_required
+def shop_create_delivery():
+    data = request.get_json() or {}
+    d = Delivery(order_id=data.get('order_id'), status=data.get('status','pending'), tracking_number=data.get('tracking_number',''),
+                 address=data.get('address',''), region=data.get('region',''), commune=data.get('commune',''),
+                 estimated_date=datetime.datetime.strptime(data['estimated_date'],'%Y-%m-%d').date() if data.get('estimated_date') else None,
+                 notes=data.get('notes',''))
+    db.session.add(d); db.session.commit()
+    return jsonify({'status':'success','delivery':{'id':d.id,'order_id':d.order_id}}), 201
+
+@shop_bp.route('/deliveries/detail', methods=['GET'])
+@token_required
+def shop_get_delivery():
+    did = request.args.get('id', type=int)
+    if not did: return jsonify({'status':'error','message':'id requis'}), 400
+    d = Delivery.query.get(did)
+    if not d: return jsonify({'status':'error','message':'Livraison introuvable'}), 404
+    return jsonify({'status':'success','delivery':{'id':d.id,'order_id':d.order_id,'status':d.status,'tracking_number':d.tracking_number,'address':d.address,'region':d.region,'commune':d.commune,'estimated_date':str(d.estimated_date) if d.estimated_date else None,'delivered_at':d.delivered_at.isoformat() if d.delivered_at else None,'notes':d.notes}})
+
+@shop_bp.route('/deliveries/update', methods=['POST'])
+@token_required
+@admin_required
+def shop_update_delivery():
+    data = request.get_json() or {}
+    did = data.get('id')
+    if not did: return jsonify({'status':'error','message':'id requis'}), 400
+    d = Delivery.query.get(did)
+    if not d: return jsonify({'status':'error','message':'Livraison introuvable'}), 404
+    d.status = data.get('status', d.status); d.tracking_number = data.get('tracking_number', d.tracking_number)
+    d.address = data.get('address', d.address); d.region = data.get('region', d.region)
+    d.commune = data.get('commune', d.commune); d.notes = data.get('notes', d.notes)
+    if data.get('estimated_date'): d.estimated_date = datetime.datetime.strptime(data['estimated_date'],'%Y-%m-%d').date()
+    if data.get('delivered_at'): d.delivered_at = datetime.datetime.strptime(data['delivered_at'],'%Y-%m-%dT%H:%M:%S')
+    db.session.commit()
+    return jsonify({'status':'success','delivery':{'id':d.id,'status':d.status}})
+
+# —— FACTURES ——
+@shop_bp.route('/invoices', methods=['GET'])
+@token_required
+def shop_list_invoices():
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 10, type=int)
+    q = Invoice.query.order_by(Invoice.issued_at.desc())
+    total = q.count()
+    invoices = q.offset((page-1)*per_page).limit(per_page).all()
+    result = []
+    for inv in invoices:
+        o = Order.query.get(inv.order_id)
+        result.append({'id':inv.id,'order_id':inv.order_id,'order_number':o.order_number if o else '—','invoice_number':inv.invoice_number,'amount':float(inv.amount),'status':inv.status,'issued_at':inv.issued_at.isoformat() if inv.issued_at else None,'paid_at':inv.paid_at.isoformat() if inv.paid_at else None,'due_date':str(inv.due_date) if inv.due_date else None})
+    return jsonify({'status':'success','page':page,'per_page':per_page,'total':total,'invoices':result})
+
+@shop_bp.route('/invoices', methods=['POST'])
+@token_required
+@admin_required
+def shop_create_invoice():
+    data = request.get_json() or {}
+    inv = Invoice(order_id=data.get('order_id'), invoice_number=generate_invoice_number(),
+                  amount=data.get('amount',0), status=data.get('status','pending'),
+                  due_date=datetime.datetime.strptime(data['due_date'],'%Y-%m-%d').date() if data.get('due_date') else None)
+    db.session.add(inv); db.session.commit()
+    return jsonify({'status':'success','invoice':{'id':inv.id,'invoice_number':inv.invoice_number}}), 201
+
+@shop_bp.route('/invoices/detail', methods=['GET'])
+@token_required
+def shop_get_invoice():
+    iid = request.args.get('id', type=int)
+    if not iid: return jsonify({'status':'error','message':'id requis'}), 400
+    inv = Invoice.query.get(iid)
+    if not inv: return jsonify({'status':'error','message':'Facture introuvable'}), 404
+    return jsonify({'status':'success','invoice':{'id':inv.id,'order_id':inv.order_id,'invoice_number':inv.invoice_number,'amount':float(inv.amount),'status':inv.status,'issued_at':inv.issued_at.isoformat() if inv.issued_at else None,'paid_at':inv.paid_at.isoformat() if inv.paid_at else None,'due_date':str(inv.due_date) if inv.due_date else None}})
+
+@shop_bp.route('/invoices/update', methods=['POST'])
+@token_required
+@admin_required
+def shop_update_invoice():
+    data = request.get_json() or {}
+    iid = data.get('id')
+    if not iid: return jsonify({'status':'error','message':'id requis'}), 400
+    inv = Invoice.query.get(iid)
+    if not inv: return jsonify({'status':'error','message':'Facture introuvable'}), 404
+    inv.status = data.get('status', inv.status)
+    if data.get('status') == 'paid' and inv.status != 'paid':
+        inv.paid_at = datetime.datetime.utcnow()
+    inv.amount = data.get('amount', inv.amount)
+    if data.get('due_date'): inv.due_date = datetime.datetime.strptime(data['due_date'],'%Y-%m-%d').date()
+    db.session.commit()
+    return jsonify({'status':'success','invoice':{'id':inv.id,'status':inv.status}})
+
+# —— STOCKS ——
+@shop_bp.route('/stock-movements', methods=['GET'])
+@token_required
+def shop_list_stock():
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 10, type=int)
+    product_id = request.args.get('product_id', type=int)
+    q = StockMovement.query.order_by(StockMovement.created_at.desc())
+    if product_id: q = q.filter_by(product_id=product_id)
+    total = q.count()
+    movements = q.offset((page-1)*per_page).limit(per_page).all()
+    result = []
+    for m in movements:
+        p = Product.query.get(m.product_id)
+        result.append({'id':m.id,'product_id':m.product_id,'product_name':p.name if p else '—','movement_type':m.movement_type,'quantity':m.quantity,'reason':m.reason,'created_at':m.created_at.isoformat() if m.created_at else None})
+    return jsonify({'status':'success','page':page,'per_page':per_page,'total':total,'movements':result})
+
+@shop_bp.route('/stock-movements/add', methods=['POST'])
+@token_required
+@admin_required
+def shop_add_stock():
+    data = request.get_json() or {}
+    pid = data.get('product_id')
+    qty = data.get('quantity', 0)
+    mtype = data.get('movement_type', 'in')
+    if not pid: return jsonify({'status':'error','message':'product_id requis'}), 400
+    p = Product.query.get(pid)
+    if not p: return jsonify({'status':'error','message':'Produit introuvable'}), 404
+    if mtype == 'in':
+        p.stock_quantity = (p.stock_quantity or 0) + qty
+    else:
+        p.stock_quantity = max(0, (p.stock_quantity or 0) - qty)
+    db.session.add(StockMovement(product_id=pid, movement_type=mtype, quantity=qty, reason=data.get('reason','Ajustement manuel')))
+    db.session.commit()
+    return jsonify({'status':'success','message':'Stock mis à jour','product':{'id':p.id,'stock_quantity':p.stock_quantity}})
+
+@shop_bp.route('/stock-movements/product', methods=['GET'])
+@token_required
+def shop_stock_by_product():
+    pid = request.args.get('id', type=int)
+    if not pid: return jsonify({'status':'error','message':'id requis'}), 400
+    p = Product.query.get(pid)
+    if not p: return jsonify({'status':'error','message':'Produit introuvable'}), 404
+    movements = StockMovement.query.filter_by(product_id=pid).order_by(StockMovement.created_at.desc()).all()
+    return jsonify({'status':'success','product':{'id':p.id,'name':p.name,'stock_quantity':p.stock_quantity},'movements':[{'id':m.id,'movement_type':m.movement_type,'quantity':m.quantity,'reason':m.reason,'created_at':m.created_at.isoformat() if m.created_at else None} for m in movements]})
+
+# ============================================================
+# BLUEPRINT : STATS
+# ============================================================
 stats_bp = Blueprint('stats', __name__, url_prefix='/api/stats')
 
 @stats_bp.route('/overview', methods=['GET'])
 @token_required
 def stats_overview():
-    total_users = User.query.count(); total_campaigns = Campaign.query.count(); total_orders = Order.query.count()
+    total_users = User.query.count(); total_campaigns = Campaign.query.filter_by(status='active').count(); total_orders = Order.query.count()
     pending_orders = Order.query.filter_by(payment_status='pending').count()
     paid_orders = Order.query.filter_by(payment_status='paid').count()
     total_revenue = db.session.query(db.func.sum(Order.total_amount)).filter_by(payment_status='paid').scalar() or 0
-    return jsonify({'status':'success','stats':{'total_users':total_users,'total_campaigns':total_campaigns,'total_orders':total_orders,'pending_orders':pending_orders,'paid_orders':paid_orders,'total_revenue':float(total_revenue)}})
+    total_products = Product.query.count(); low_stock = Product.query.filter(Product.stock_quantity <= 5).count()
+    total_suppliers = Supplier.query.count(); total_invoices = Invoice.query.count()
+    return jsonify({'status':'success','stats':{'total_users':total_users,'total_campaigns':total_campaigns,'total_orders':total_orders,'pending_orders':pending_orders,'paid_orders':paid_orders,'total_revenue':float(total_revenue),'total_products':total_products,'low_stock':low_stock,'total_suppliers':total_suppliers,'total_invoices':total_invoices}})
 
+# ============================================================
+# BLUEPRINT : BOT
+# ============================================================
 bot_bp = Blueprint('bot', __name__, url_prefix='/api/bot')
 
 @bot_bp.route('/stats', methods=['GET'])
@@ -390,6 +918,9 @@ def generate_bot_token():
     token = hashlib.sha256(token_raw.encode()).hexdigest()[:32]
     return jsonify({'token':f"{phone}|{token}"})
 
+# ============================================================
+# BLUEPRINTS INIT / SEED
+# ============================================================
 init_bp = Blueprint('init', __name__, url_prefix='/api')
 
 @init_bp.route('/init-db', methods=['GET'])
@@ -406,32 +937,68 @@ seed_bp = Blueprint('seed', __name__, url_prefix='/api')
 @seed_bp.route('/seed', methods=['GET','POST'])
 def seed():
     try:
-        db.session.query(BotMessage).delete(); db.session.query(BotStat).delete()
+        # Suppression douce — on conserve les stats bot (BotMessage & BotStat)
+        db.session.query(StockMovement).delete(); db.session.query(Invoice).delete()
+        db.session.query(Delivery).delete(); db.session.query(OrderItem).delete()
+        db.session.query(CartItem).delete(); db.session.query(Product).delete()
+        db.session.query(Supplier).delete()
         db.session.query(Order).delete(); db.session.query(Campaign).delete(); db.session.query(User).delete()
         db.session.commit()
-        u1 = User(phone='0050912345678', pin_hash=hash_pin('1234'), first_name='Jean', last_name='Pierre', email='jean@coalition509.ht', role='user', status='active', region='Ouest', commune='Port-au-Prince', profile_type='Animateur NGD', ngd_id=generate_ngd_id())
-        u2 = User(phone='0050987654321', pin_hash=hash_pin('1234'), first_name='Marie', last_name='Joseph', email='marie@coalition509.ht', role='admin', status='active', region='Nord', commune='Cap-Haitien', profile_type='Superviseur', ngd_id=generate_ngd_id())
-        db.session.add_all([u1,u2]); db.session.commit()
-        c1 = Campaign(name='Campagne Senatoriale Nord', description='Campagne senatoriale pour le departement du Nord.', election_date=datetime.date(2025,11,30), region='Nord', commune='Cap-Haitien', status='active', created_by=u2.id)
-        c2 = Campaign(name='Campagne Presidentielle 2025', description='Mobilisation nationale pour les elections presidentielles.', election_date=datetime.date(2025,11,30), region='Ouest', commune='Port-au-Prince', status='active', created_by=u1.id)
-        db.session.add_all([c1,c2]); db.session.commit()
-        o1 = Order(order_number='CMD-001', user_id=u1.id, campaign_id=c2.id, total_amount=5900, status='completed', payment_status='paid', payment_method='MonCash', region='Ouest', commune='Port-au-Prince')
-        o2 = Order(order_number='CMD-002', user_id=u2.id, campaign_id=c1.id, total_amount=9440, status='pending', payment_status='pending', region='Nord', commune='Cap-Haitien')
-        db.session.add_all([o1,o2]); db.session.commit()
-        for i in range(7):
-            d = datetime.date.today() - datetime.timedelta(days=i)
-            bs = BotStat(date=d, messages_sent=10+i, messages_received=5+i, unique_users=3, conversions=1)
-            db.session.add(bs)
-        db.session.commit()
-        for i in range(3):
-            m = BotMessage(phone='0050912345678', message=f'Message test {i+1}', direction='in' if i%2==0 else 'out')
-            db.session.add(m)
-        db.session.commit()
-        return jsonify({'status':'success','message':'Donnees de test injectees'})
+
+        # ========== 9 PILOTES (indicatif 00225 — Côte d'Ivoire) ==========
+        users_data = [
+            ('002250707777701', '1234', 'Jean', 'Kouassi', 'jean@coalition509.ci', 'admin', 'active', 'Abidjan', 'Cocody', 'Superviseur'),
+            ('002250707777702', '1234', 'Marie', 'Yao', 'marie@coalition509.ci', 'admin', 'active', 'Abidjan', 'Plateau', 'Superviseur'),
+            ('002250707777703', '1234', 'Koffi', 'Bamba', 'koffi@coalition509.ci', 'user', 'active', 'Bouaké', 'Bouaké', 'Animateur NGD'),
+            ('002250707777704', '1234', 'Aminata', 'Diallo', 'aminata@coalition509.ci', 'user', 'active', 'Yamoussoukro', 'Yamoussoukro', 'Animateur NGD'),
+            ('002250707777705', '1234', 'Yao', 'Kouamé', 'yao@coalition509.ci', 'user', 'active', 'San-Pédro', 'San-Pédro', 'Animateur NGD'),
+            ('002250707777706', '1234', 'Fatou', "N'Guessan", 'fatou@coalition509.ci', 'user', 'active', 'Korhogo', 'Korhogo', 'Animateur NGD'),
+            ('002250707777707', '1234', 'Emmanuel', 'Koné', 'emmanuel@coalition509.ci', 'user', 'active', 'Daloa', 'Daloa', 'Animateur NGD'),
+            ('002250707777708', '1234', 'Rose', 'Achi', 'rose@coalition509.ci', 'user', 'active', 'Man', 'Man', 'Animateur NGD'),
+            ('002250707777709', '1234', 'Paul', 'Bété', 'paul@coalition509.ci', 'user', 'active', 'Abidjan', 'Marcory', 'Animateur NGD'),
+        ]
+        created_users = []
+        for phone, pin, fn, ln, email, role, status, region, commune, ptype in users_data:
+            u = User(phone=phone, pin_hash=hash_pin(pin), first_name=fn, last_name=ln, email=email,
+                     role=role, status=status, region=region, commune=commune, profile_type=ptype, ngd_id=generate_ngd_id())
+            db.session.add(u); db.session.commit()
+            created_users.append(u)
+
+        # ========== 4 CAMPAGNES INACTIVE ==========
+        campaigns_data = [
+            ('Campagne Présidentielle 2025', 'Mobilisation nationale pour les élections présidentielles.', datetime.date(2025,10,25), 'Abidjan', 'Cocody', 'inactive', created_users[0].id),
+            ('Campagne Législatives Sud', 'Campagne législative pour les circonscriptions du sud.', datetime.date(2025,11,15), 'Abidjan', 'Marcory', 'inactive', created_users[1].id),
+            ('Campagne Municipales Cocody', 'Élections municipales — commune de Cocody.', datetime.date(2025,12,1), 'Abidjan', 'Cocody', 'inactive', created_users[0].id),
+            ('Campagne Régionale Savanes', 'Élections régionales dans la région des Savanes.', datetime.date(2025,11,30), 'Korhogo', 'Korhogo', 'inactive', created_users[5].id),
+        ]
+        created_campaigns = []
+        for name, desc, edate, region, commune, status, created_by in campaigns_data:
+            c = Campaign(name=name, description=desc, election_date=edate, region=region, commune=commune, status=status, created_by=created_by)
+            db.session.add(c); db.session.commit()
+            created_campaigns.append(c)
+
+        # ========== FOURNISSEURS ==========
+        s1 = Supplier(name='TCL Distribution CI', contact_name='Pierre Durand', phone='002250707777710', email='tcl@coalition509.ci', region='Abidjan', commune='Cocody', address='12 Boulevard Latrille', status='active')
+        s2 = Supplier(name='PrintPro CI', contact_name='Marie Luce', phone='002250707777711', email='print@coalition509.ci', region='Abidjan', commune='Plateau', address='45 Avenue Champs de Mars', status='active')
+        db.session.add_all([s1,s2]); db.session.commit()
+
+        # ========== PRODUITS ==========
+        p1 = Product(name='T-Shirt Coalition 509', description='T-shirt officiel 100% coton', category='textile', price=2500, stock_quantity=50, supplier_id=s1.id, status='active')
+        p2 = Product(name='Casquette NGD', description='Casquette brodée logo NGD', category='textile', price=1500, stock_quantity=30, supplier_id=s1.id, status='active')
+        p3 = Product(name='Affiches A3 (lot 100)', description='Affiches électorales haute qualité', category='imprimerie', price=3500, stock_quantity=20, supplier_id=s2.id, status='active')
+        p4 = Product(name='Flyers A5 (lot 500)', description='Flyers recto/verso couleur', category='imprimerie', price=2000, stock_quantity=100, supplier_id=s2.id, status='active')
+        db.session.add_all([p1,p2,p3,p4]); db.session.commit()
+
+        # ========== 0 COMMANDE (cohérent post-reset) ==========
+        # Aucune commande, facture ou livraison créée
+
+        return jsonify({'status':'success','message':'Données de test injectées — 9 pilotes, 4 campagnes INACTIVE, 0 commande, stats bot conservées'})
     except Exception as e:
         db.session.rollback()
         return jsonify({'status':'error','message':str(e)}), 500
-
+# ============================================================
+# BLUEPRINT : V1 (legacy compat)
+# ============================================================
 v1_bp = Blueprint('v1', __name__, url_prefix='/api/v1')
 
 @v1_bp.route('/auth/login', methods=['POST'])
@@ -450,11 +1017,13 @@ def v1_verify_bot_token(): return verify_bot_token()
 @v1_bp.route('/dashboard/stats', methods=['GET'])
 @token_required
 def v1_dashboard_stats():
-    total_users = User.query.count(); total_campaigns = Campaign.query.count(); total_orders = Order.query.count()
+    total_users = User.query.count(); total_campaigns = Campaign.query.filter_by(status='active').count(); total_orders = Order.query.count()
     pending_orders = Order.query.filter_by(payment_status='pending').count()
     paid_orders = Order.query.filter_by(payment_status='paid').count()
     total_revenue = db.session.query(db.func.sum(Order.total_amount)).filter_by(payment_status='paid').scalar() or 0
-    return jsonify({'total_users':total_users,'total_campaigns':total_campaigns,'total_orders':total_orders,'pending_orders':pending_orders,'paid_orders':paid_orders,'total_revenue':float(total_revenue),'total_groups':0,'pending_withdrawals':0})
+    total_products = Product.query.count(); low_stock = Product.query.filter(Product.stock_quantity <= 5).count()
+    total_suppliers = Supplier.query.count(); total_invoices = Invoice.query.count()
+    return jsonify({'total_users':total_users,'total_campaigns':total_campaigns,'total_orders':total_orders,'pending_orders':pending_orders,'paid_orders':paid_orders,'total_revenue':float(total_revenue),'total_groups':0,'pending_withdrawals':0,'total_products':total_products,'low_stock':low_stock,'total_suppliers':total_suppliers,'total_invoices':total_invoices})
 
 @v1_bp.route('/campaigns', methods=['GET'])
 @token_required
@@ -522,6 +1091,9 @@ def v1_bot_stats(): return jsonify(build_bot_stats_response())
 @token_required
 def v1_bot_stats_history(): return bot_stats_history()
 
+# ============================================================
+# REGISTREMENT BLUEPRINTS
+# ============================================================
 app.register_blueprint(auth_bp)
 app.register_blueprint(users_bp)
 app.register_blueprint(campaigns_bp)
@@ -531,10 +1103,11 @@ app.register_blueprint(bot_bp)
 app.register_blueprint(init_bp)
 app.register_blueprint(seed_bp)
 app.register_blueprint(v1_bp)
+app.register_blueprint(shop_bp)
 
 @app.route('/')
 def index():
-    return jsonify({'service':'Coalition 509 API','version':'2.8.7','status':'ok'})
+    return jsonify({'service':'Coalition 509 API','version':'2.9.0','status':'ok','modules':['auth','campaigns','users','orders','bot','shop']})
 
 def auto_migrate():
     try:
@@ -551,7 +1124,7 @@ def auto_migrate():
 
 with app.app_context():
     db.create_all()
-    print("[BOOT] Tables verifiees/creees")
+    print("[BOOT] Tables verifiees/creees v2.9.0")
     auto_migrate()
 
 if __name__ == '__main__':
