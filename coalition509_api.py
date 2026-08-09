@@ -982,12 +982,22 @@ def seed():
         s2 = Supplier(name='PrintPro CI', contact_name='Marie Luce', phone='002250707777711', email='print@coalition509.ci', region='Abidjan', commune='Plateau', address='45 Avenue Champs de Mars', status='active')
         db.session.add_all([s1,s2]); db.session.commit()
 
-        # ========== PRODUITS ==========
-        p1 = Product(name='T-Shirt Coalition 509', description='T-shirt officiel 100% coton', category='textile', price=2500, stock_quantity=50, supplier_id=s1.id, status='active')
-        p2 = Product(name='Casquette NGD', description='Casquette brodée logo NGD', category='textile', price=1500, stock_quantity=30, supplier_id=s1.id, status='active')
-        p3 = Product(name='Affiches A3 (lot 100)', description='Affiches électorales haute qualité', category='imprimerie', price=3500, stock_quantity=20, supplier_id=s2.id, status='active')
-        p4 = Product(name='Flyers A5 (lot 500)', description='Flyers recto/verso couleur', category='imprimerie', price=2000, stock_quantity=100, supplier_id=s2.id, status='active')
-        db.session.add_all([p1,p2,p3,p4]); db.session.commit()
+        # ========== 10 PRODUITS ==========
+        products_data = [
+            ('Affiche A3 (lot 100)', 'Affiches électorales haute qualité format A3', 'imprimerie', 3500, 20, s2.id, 'https://ibb.co/60p9x2d3'),
+            ('Brainstorming Session', 'Session de brainstorming stratégique 2h', 'service', 15000, 999, s1.id, 'https://ibb.co/VWB13kfm'),
+            ('Casquette Coalition 509', 'Casquette brodée logo officiel', 'textile', 1500, 30, s1.id, 'https://ibb.co/JWbVq3Wf'),
+            ('Flyers A5 (lot 500)', 'Flyers recto/verso couleur', 'imprimerie', 2000, 100, s2.id, 'https://ibb.co/svfwsYRV'),
+            ('Pack Hôtel Électoral', 'Réservation hôtel + transport pour équipe', 'service', 75000, 50, s1.id, 'https://ibb.co/XZ8FjkPt'),
+            ('Pack Locomotion', 'Location véhicule + carburant journée', 'service', 45000, 30, s1.id, 'https://ibb.co/XrrQNKFb'),
+            ('Personal Branding', 'Kit photo + CV politique + réseaux', 'service', 25000, 100, s2.id, 'https://ibb.co/jv7gJVzY'),
+            ('Podcast Campagne', 'Production podcast 3 épisodes', 'service', 35000, 20, s2.id, 'https://ibb.co/8JxpjsR'),
+            ('Pack Restaurant', 'Traiteur 50 personnes + mobilier', 'service', 125000, 10, s1.id, 'https://ibb.co/PGTP1KTk'),
+            ('T-Shirt Coalition 509', 'T-shirt officiel 100% coton', 'textile', 2500, 50, s1.id, 'https://ibb.co/PZBDw2bR'),
+        ]
+        for name, desc, cat, price, stock, supp_id, img in products_data:
+            db.session.add(Product(name=name, description=desc, category=cat, price=price, stock_quantity=stock, supplier_id=supp_id, status='active', image_url=img))
+        db.session.commit()
 
         # ========== 0 COMMANDE (cohérent post-reset) ==========
         # Aucune commande, facture ou livraison créée
@@ -1107,7 +1117,7 @@ app.register_blueprint(shop_bp)
 
 @app.route('/')
 def index():
-    return jsonify({'service':'Coalition 509 API','version':'2.9.0','status':'ok','modules':['auth','campaigns','users','orders','bot','shop']})
+    return jsonify({'service':'Coalition 509 API','version':'2.9.1','status':'ok','modules':['auth','campaigns','users','orders','bot','shop']})
 
 def auto_migrate():
     try:
