@@ -1,5 +1,5 @@
 """
-Coalition 509 API — Backend v2.9.0
+Coalition 509 API — Backend v2.9.2
 Module SHOP intégré : Produits, Panier, Commandes, Fournisseurs, Livraisons, Paiements, Factures, Stocks
 Fix : pool_pre_ping + pool_recycle, init-db doux, stats bot wrapped, verify_bot_token robuste
 RÈGLE D'OR : pas de chevrons <> dans les routes Flask — query params uniquement
@@ -187,6 +187,9 @@ def token_required(f):
             if 'Authorization' in request.headers:
                 parts = request.headers['Authorization'].split()
                 if len(parts) == 2 and parts[0] == 'Bearer': token = parts[1]
+            # Fallback: token dans l'URL (pour exports CSV ouvert dans nouvel onglet)
+            if not token:
+                token = request.args.get('access_token')
             if not token:
                 return jsonify({'status':'error','message':'Token manquant'}), 401
             user = User.query.filter_by(phone=token).first()
@@ -1117,7 +1120,7 @@ app.register_blueprint(shop_bp)
 
 @app.route('/')
 def index():
-    return jsonify({'service':'Coalition 509 API','version':'2.9.1','status':'ok','modules':['auth','campaigns','users','orders','bot','shop']})
+    return jsonify({'service':'Coalition 509 API','version':'2.9.2','status':'ok','modules':['auth','campaigns','users','orders','bot','shop']})
 
 def auto_migrate():
     try:
