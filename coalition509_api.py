@@ -1,5 +1,5 @@
 """
-Coalition 509 API — Backend v2.9.3
+Coalition 509 API — Backend v2.9.4
 Module SHOP intégré : Produits, Panier, Commandes, Fournisseurs, Livraisons, Paiements, Factures, Stocks
 Fix : teardown session + rollback stats + SSL EOF robustness
 RÈGLE D'OR : pas de chevrons <> dans les routes Flask — query params uniquement
@@ -998,16 +998,16 @@ def seed():
         db.session.add_all([s1,s2]); db.session.commit()
 
         products_data = [
-            ('Affiche A3 (lot 100)', 'Affiches électorales haute qualité format A3', 'imprimerie', 3500, 20, s2.id, './images/affiche-a3.png'),
-            ('Brainstorming Session', 'Session de brainstorming stratégique 2h', 'service', 15000, 999, s1.id, './images/brainstorming.png'),
-            ('Casquette Coalition 509', 'Casquette brodée logo officiel', 'textile', 1500, 30, s1.id, './images/casquette.png'),
-            ('Flyers A5 (lot 500)', 'Flyers recto/verso couleur', 'imprimerie', 2000, 100, s2.id, './images/flyers.png'),
-            ('Pack Hôtel Électoral', 'Réservation hôtel + transport pour équipe', 'service', 75000, 50, s1.id, './images/hotel.png'),
-            ('Pack Locomotion', 'Location véhicule + carburant journée', 'service', 45000, 30, s1.id, './images/locomotion.png'),
-            ('Personal Branding', 'Kit photo + CV politique + réseaux', 'service', 25000, 100, s2.id, './images/personal-branding.png'),
-            ('Podcast Campagne', 'Production podcast 3 épisodes', 'service', 35000, 20, s2.id, './images/podcast.png'),
-            ('Pack Restaurant', 'Traiteur 50 personnes + mobilier', 'service', 125000, 10, s1.id, './images/restaurant.png'),
-            ('T-Shirt Coalition 509', 'T-shirt officiel 100% coton', 'textile', 2500, 50, s1.id, './images/tshirt.png'),
+            ('Affiche A3 (lot 100)', 'Affiches électorales haute qualité format A3', 'imprimerie', 3500, 20, s2.id, 'https://i.ibb.co/LdqjWMGL/Affiche-A3-Saa-S.png'),
+            ('Brainstorming Session', 'Session de brainstorming stratégique 2h', 'service', 15000, 999, s1.id, 'https://i.ibb.co/xS5k3rxH/Brainstorming-Saa-S.png'),
+            ('Casquette Coalition 509', 'Casquette brodée logo officiel', 'textile', 1500, 30, s1.id, 'https://i.ibb.co/DP6hYrPx/Casquettes-Saa-S.png'),
+            ('Flyers A5 (lot 500)', 'Flyers recto/verso couleur', 'imprimerie', 2000, 100, s2.id, 'https://i.ibb.co/1fgqRWQm/Flyers-Saa-S.png'),
+            ('Pack Hôtel Électoral', 'Réservation hôtel + transport pour équipe', 'service', 75000, 50, s1.id, 'https://i.ibb.co/8DcPN4w9/H-tel-Saa-S.png'),
+            ('Pack Locomotion', 'Location véhicule + carburant journée', 'service', 45000, 30, s1.id, 'https://i.ibb.co/jPPNBQ3T/Locomotion-Saa-S.png'),
+            ('Personal Branding', 'Kit photo + CV politique + réseaux', 'service', 25000, 100, s2.id, 'https://i.ibb.co/ynLW4hpC/Personnal-Branding-Saa-S.png'),
+            ('Podcast Campagne', 'Production podcast 3 épisodes', 'service', 35000, 20, s2.id, 'https://i.ibb.co/vbdGJqr/Podcast-Saa-S.png'),
+            ('Pack Restaurant', 'Traiteur 50 personnes + mobilier', 'service', 125000, 10, s1.id, 'https://i.ibb.co/ZzHFc5H9/Restaurant-Saa-S.png'),
+            ('T-Shirt Coalition 509', 'T-shirt officiel 100% coton', 'textile', 2500, 50, s1.id, 'https://i.ibb.co/QFsDrWqZ/T-Shirts-Saa-S.png'),
         ]
         for name, desc, cat, price, stock, supp_id, img in products_data:
             db.session.add(Product(name=name, description=desc, category=cat, price=price, stock_quantity=stock, supplier_id=supp_id, status='active', image_url=img))
@@ -1152,7 +1152,7 @@ def auto_migrate():
 
 with app.app_context():
     db.create_all()
-    print("[BOOT] Tables verifiees/creees v2.9.3")
+    print("[BOOT] Tables verifiees/creees v2.9.4")
     auto_migrate()
 
 if __name__ == '__main__':
