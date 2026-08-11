@@ -1,5 +1,5 @@
 """
-Coalition 509 API — Backend v2.9.5
+Coalition 509 API — Backend v2.9.4
 Module SHOP intégré : Produits, Panier, Commandes, Fournisseurs, Livraisons, Paiements, Factures, Stocks
 Fix : teardown session + rollback stats + SSL EOF robustness
 RÈGLE D'OR : pas de chevrons <> dans les routes Flask — query params uniquement
@@ -145,7 +145,6 @@ class Delivery(db.Model):
     __tablename__ = 'deliveries'
     id = db.Column(db.Integer, primary_key=True)
     order_id = db.Column(db.Integer, db.ForeignKey('orders.id'), nullable=False)
-    supplier_id = db.Column(db.Integer, db.ForeignKey('suppliers.id'))
     status = db.Column(db.String(20), default='pending')
     tracking_number = db.Column(db.String(100))
     address = db.Column(db.Text)
@@ -153,8 +152,6 @@ class Delivery(db.Model):
     commune = db.Column(db.String(50))
     estimated_date = db.Column(db.Date)
     delivered_at = db.Column(db.DateTime)
-    delivery_person = db.Column(db.String(100))
-    delivery_phone = db.Column(db.String(20))
     notes = db.Column(db.Text)
     created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
 
@@ -582,10 +579,6 @@ def shop_create_order():
     order = Order(order_number=generate_order_number(), user_id=user_id, total_amount=0,
                   status='pending', payment_status='pending', region=data.get('region',''), commune=data.get('commune',''))
     db.session.add(order); db.session.commit()
-
-    # Suivi des fournisseurs concernés pour livraison auto
-    suppliers_map = {}  # supplier_id -> {'items': [], 'subtotal': 0}
-
     for ci in cart_items:
         p = Product.query.get(ci.product_id)
         if not p: continue
@@ -593,84 +586,10 @@ def shop_create_order():
         db.session.add(OrderItem(order_id=order.id, product_id=p.id, quantity=ci.quantity, unit_price=p.price, total_price=sub))
         p.stock_quantity = max(0, (p.stock_quantity or 0) - ci.quantity)
         db.session.add(StockMovement(product_id=p.id, movement_type='out', quantity=ci.quantity, reason=f'Commande {order.order_number}'))
-
-        # Sélection auto fournisseur par produit
-        if p.supplier_id:
-            if p.supplier_id not in suppliers_map:
-                suppliers_map[p.supplier_id] = {'items': [], 'subtotal': 0}
-            suppliers_map[p.supplier_id]['items'].append(p.name)
-            suppliers_map[p.supplier_id]['subtotal'] += sub
-
     order.total_amount = total
-
-    # === AUTO-FACTURE ===
-    invoice = Invoice(
-        order_id=order.id,
-        invoice_number=generate_invoice_number(),
-        amount=total,
-        status='pending',
-        due_date=datetime.date.today() + datetime.timedelta(days=7)
-    )
-    db.session.add(invoice)
-
-    # === AUTO-LIVRAISON + SÉLECTION AUTO FOURNISSEUR & LIVREUR ===
-    deliveries_created = []
-    if suppliers_map:
-        for sid, info in suppliers_map.items():
-            supplier = Supplier.query.get(sid)
-            if supplier:
-                # Livreur = contact du fournisseur (sélection auto)
-                delivery = Delivery(
-                    order_id=order.id,
-                    supplier_id=supplier.id,
-                    status='pending',
-                    address=supplier.address or data.get('address',''),
-                    region=supplier.region or data.get('region',''),
-                    commune=supplier.commune or data.get('commune',''),
-                    estimated_date=datetime.date.today() + datetime.timedelta(days=3),
-                    delivery_person=supplier.contact_name or 'Livreur assigné',
-                    delivery_phone=supplier.phone or '',
-                    notes=f"Livraison auto — {len(info['items'])} article(s): {', '.join(info['items'][:3])}{'...' if len(info['items']) > 3 else ''}"
-                )
-                db.session.add(delivery)
-                deliveries_created.append({
-                    'id': delivery.id,
-                    'supplier_name': supplier.name,
-                    'delivery_person': delivery.delivery_person,
-                    'delivery_phone': delivery.delivery_phone,
-                    'estimated_date': str(delivery.estimated_date),
-                    'status': delivery.status
-                })
-    else:
-        # Aucun fournisseur identifié — livraison générique
-        delivery = Delivery(
-            order_id=order.id,
-            status='pending',
-            region=data.get('region',''),
-            commune=data.get('commune',''),
-            estimated_date=datetime.date.today() + datetime.timedelta(days=3),
-            delivery_person="Livreur en attente d'assignation",
-            notes='Livraison générique — fournisseur non identifié'
-        )
-        db.session.add(delivery)
-        deliveries_created.append({
-            'id': delivery.id,
-            'supplier_name': None,
-            'delivery_person': delivery.delivery_person,
-            'delivery_phone': '',
-            'estimated_date': str(delivery.estimated_date),
-            'status': delivery.status
-        })
-
     CartItem.query.filter_by(user_id=user_id).delete()
     db.session.commit()
-
-    return jsonify({
-        'status':'success',
-        'order':{'id':order.id,'order_number':order.order_number,'total_amount':float(total)},
-        'invoice':{'invoice_number':invoice.invoice_number,'amount':float(invoice.amount),'status':invoice.status,'due_date':str(invoice.due_date)},
-        'deliveries':deliveries_created
-    }), 201
+    return jsonify({'status':'success','order':{'id':order.id,'order_number':order.order_number,'total_amount':total}}), 201
 
 @shop_bp.route('/orders/detail', methods=['GET'])
 @token_required
@@ -686,23 +605,8 @@ def shop_get_order():
         p = Product.query.get(it.product_id)
         items_out.append({'id':it.id,'product_name':p.name if p else '—','quantity':it.quantity,'unit_price':float(it.unit_price),'total_price':float(it.total_price)})
     inv = Invoice.query.filter_by(order_id=o.id).first()
-    deliveries = Delivery.query.filter_by(order_id=o.id).all()
-    deliveries_out = []
-    for d in deliveries:
-        s = Supplier.query.get(d.supplier_id) if d.supplier_id else None
-        deliveries_out.append({
-            'id':d.id,
-            'status':d.status,
-            'tracking_number':d.tracking_number,
-            'estimated_date':str(d.estimated_date) if d.estimated_date else None,
-            'delivered_at':d.delivered_at.isoformat() if d.delivered_at else None,
-            'supplier':{'id':s.id,'name':s.name,'phone':s.phone} if s else None,
-            'delivery_person':d.delivery_person,
-            'delivery_phone':d.delivery_phone,
-            'address':d.address,
-            'notes':d.notes
-        })
-    return jsonify({'status':'success','order':{'id':o.id,'order_number':o.order_number,'total_amount':float(o.total_amount) if o.total_amount else 0,'status':o.status,'payment_status':o.payment_status,'payment_method':o.payment_method,'region':o.region,'commune':o.commune,'created_at':o.created_at.isoformat() if o.created_at else None,'user':{'id':u.id,'phone':u.phone,'first_name':u.first_name,'last_name':u.last_name} if u else None,'items':items_out,'invoice':{'id':inv.id,'invoice_number':inv.invoice_number,'amount':float(inv.amount),'status':inv.status} if inv else None,'deliveries':deliveries_out}})
+    delivery = Delivery.query.filter_by(order_id=o.id).first()
+    return jsonify({'status':'success','order':{'id':o.id,'order_number':o.order_number,'total_amount':float(o.total_amount) if o.total_amount else 0,'status':o.status,'payment_status':o.payment_status,'payment_method':o.payment_method,'region':o.region,'commune':o.commune,'created_at':o.created_at.isoformat() if o.created_at else None,'user':{'id':u.id,'phone':u.phone,'first_name':u.first_name,'last_name':u.last_name} if u else None,'items':items_out,'invoice':{'id':inv.id,'invoice_number':inv.invoice_number,'amount':float(inv.amount),'status':inv.status} if inv else None,'delivery':{'id':delivery.id,'status':delivery.status,'tracking_number':delivery.tracking_number,'estimated_date':str(delivery.estimated_date) if delivery.estimated_date else None} if delivery else None}})
 
 @shop_bp.route('/orders/update', methods=['POST'])
 @token_required
@@ -802,8 +706,7 @@ def shop_list_deliveries():
     result = []
     for d in deliveries:
         o = Order.query.get(d.order_id)
-        s = Supplier.query.get(d.supplier_id) if d.supplier_id else None
-        result.append({'id':d.id,'order_id':d.order_id,'order_number':o.order_number if o else '—','status':d.status,'tracking_number':d.tracking_number,'address':d.address,'region':d.region,'commune':d.commune,'estimated_date':str(d.estimated_date) if d.estimated_date else None,'delivered_at':d.delivered_at.isoformat() if d.delivered_at else None,'delivery_person':d.delivery_person,'delivery_phone':d.delivery_phone,'supplier_name':s.name if s else '—','notes':d.notes,'created_at':d.created_at.isoformat() if d.created_at else None})
+        result.append({'id':d.id,'order_id':d.order_id,'order_number':o.order_number if o else '—','status':d.status,'tracking_number':d.tracking_number,'address':d.address,'region':d.region,'commune':d.commune,'estimated_date':str(d.estimated_date) if d.estimated_date else None,'delivered_at':d.delivered_at.isoformat() if d.delivered_at else None,'notes':d.notes,'created_at':d.created_at.isoformat() if d.created_at else None})
     return jsonify({'status':'success','page':page,'per_page':per_page,'total':total,'deliveries':result})
 
 @shop_bp.route('/deliveries', methods=['POST'])
@@ -839,9 +742,6 @@ def shop_update_delivery():
     d.status = data.get('status', d.status); d.tracking_number = data.get('tracking_number', d.tracking_number)
     d.address = data.get('address', d.address); d.region = data.get('region', d.region)
     d.commune = data.get('commune', d.commune); d.notes = data.get('notes', d.notes)
-    d.delivery_person = data.get('delivery_person', d.delivery_person)
-    d.delivery_phone = data.get('delivery_phone', d.delivery_phone)
-    if data.get('supplier_id'): d.supplier_id = data.get('supplier_id')
     if data.get('estimated_date'): d.estimated_date = datetime.datetime.strptime(data['estimated_date'],'%Y-%m-%d').date()
     if data.get('delivered_at'): d.delivered_at = datetime.datetime.strptime(data['delivered_at'],'%Y-%m-%dT%H:%M:%S')
     db.session.commit()
@@ -1235,7 +1135,7 @@ app.register_blueprint(shop_bp)
 
 @app.route('/')
 def index():
-    return jsonify({'service':'Coalition 509 API','version':'2.9.5','status':'ok','modules':['auth','campaigns','users','orders','bot','shop']})
+    return jsonify({'service':'Coalition 509 API','version':'2.9.3','status':'ok','modules':['auth','campaigns','users','orders','bot','shop']})
 
 def auto_migrate():
     try:
@@ -1247,36 +1147,12 @@ def auto_migrate():
                 print("[MIGRATE] Colonne 'source' ajoutee a bot_stats")
             else:
                 print("[MIGRATE] Colonne 'source' deja presente")
-
-            result2 = conn.execute(db.text("SELECT column_name FROM information_schema.columns WHERE table_name='deliveries' AND column_name='supplier_id'"))
-            if not result2.fetchone():
-                conn.execute(db.text("ALTER TABLE deliveries ADD COLUMN supplier_id INTEGER"))
-                conn.commit()
-                print("[MIGRATE] Colonne 'supplier_id' ajoutee a deliveries")
-            else:
-                print("[MIGRATE] Colonne 'supplier_id' deja presente")
-
-            result3 = conn.execute(db.text("SELECT column_name FROM information_schema.columns WHERE table_name='deliveries' AND column_name='delivery_person'"))
-            if not result3.fetchone():
-                conn.execute(db.text("ALTER TABLE deliveries ADD COLUMN delivery_person VARCHAR(100)"))
-                conn.commit()
-                print("[MIGRATE] Colonne 'delivery_person' ajoutee a deliveries")
-            else:
-                print("[MIGRATE] Colonne 'delivery_person' deja presente")
-
-            result4 = conn.execute(db.text("SELECT column_name FROM information_schema.columns WHERE table_name='deliveries' AND column_name='delivery_phone'"))
-            if not result4.fetchone():
-                conn.execute(db.text("ALTER TABLE deliveries ADD COLUMN delivery_phone VARCHAR(20)"))
-                conn.commit()
-                print("[MIGRATE] Colonne 'delivery_phone' ajoutee a deliveries")
-            else:
-                print("[MIGRATE] Colonne 'delivery_phone' deja presente")
     except Exception as e:
         print(f"[MIGRATE] {e}")
 
 with app.app_context():
     db.create_all()
-    print("[BOOT] Tables verifiees/creees v2.9.5")
+    print("[BOOT] Tables verifiees/creees v2.9.4")
     auto_migrate()
 
 if __name__ == '__main__':
