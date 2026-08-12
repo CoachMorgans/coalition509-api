@@ -1,5 +1,5 @@
 """
-Coalition 509 API — Backend v2.9.5
+Coalition 509 API — Backend v2.9.6
 Module SHOP intégré : Produits, Panier, Commandes, Fournisseurs, Livraisons, Paiements, Factures, Stocks
 Fix : teardown session + rollback stats + SSL EOF robustness
 RÈGLE D'OR : pas de chevrons <> dans les routes Flask — query params uniquement
@@ -57,9 +57,12 @@ class Campaign(db.Model):
     name = db.Column(db.String(200), nullable=False)
     description = db.Column(db.Text)
     election_date = db.Column(db.Date)
+    election_type = db.Column(db.String(50))
     region = db.Column(db.String(50))
     commune = db.Column(db.String(50))
     status = db.Column(db.String(20), default='active')
+    price = db.Column(db.Numeric(12, 2), default=0)
+    pricing_model = db.Column(db.String(20), default='forfait')
     created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
     created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
 
@@ -330,7 +333,14 @@ users_bp = Blueprint('users', __name__, url_prefix='/api/users')
 def list_users():
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', 10, type=int)
+    search = request.args.get('search', '').strip()
     q = User.query.order_by(User.created_at.desc())
+    if search:
+        q = q.filter(db.or_(
+            User.first_name.ilike(f'%{search}%'),
+            User.last_name.ilike(f'%{search}%'),
+            User.phone.ilike(f'%{search}%')
+        ))
     total = q.count()
     users = q.offset((page-1)*per_page).limit(per_page).all()
     return jsonify({'status':'success','page':page,'per_page':per_page,'total':total,'users':[{'id':u.id,'phone':u.phone,'first_name':u.first_name,'last_name':u.last_name,'email':u.email,'role':u.role,'status':u.status,'region':u.region,'commune':u.commune,'profile_type':u.profile_type,'ngd_id':u.ngd_id,'created_at':u.created_at.isoformat() if u.created_at else None} for u in users]})
@@ -345,18 +355,38 @@ campaigns_bp = Blueprint('campaigns', __name__, url_prefix='/api/campaigns')
 def list_campaigns():
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', 10, type=int)
+    status = request.args.get('status', '').strip()
+    search = request.args.get('search', '').strip()
+    region = request.args.get('region', '').strip()
     q = Campaign.query.order_by(Campaign.created_at.desc())
+    if status:
+        q = q.filter_by(status=status)
+    if region:
+        q = q.filter(Campaign.region.ilike(f'%{region}%'))
+    if search:
+        q = q.filter(db.or_(
+            Campaign.name.ilike(f'%{search}%'),
+            Campaign.description.ilike(f'%{search}%')
+        ))
     total = q.count()
     camps = q.offset((page-1)*per_page).limit(per_page).all()
-    return jsonify({'status':'success','page':page,'per_page':per_page,'total':total,'campaigns':[{'id':c.id,'name':c.name,'description':c.description,'election_date':str(c.election_date) if c.election_date else None,'region':c.region,'commune':c.commune,'status':c.status,'created_by':c.created_by,'created_at':c.created_at.isoformat() if c.created_at else None} for c in camps]})
+    return jsonify({'status':'success','page':page,'per_page':per_page,'total':total,'campaigns':[{'id':c.id,'name':c.name,'description':c.description,'election_date':str(c.election_date) if c.election_date else None,'election_type':c.election_type,'region':c.region,'commune':c.commune,'status':c.status,'price':float(c.price) if c.price else 0,'pricing_model':c.pricing_model,'created_by':c.created_by,'created_at':c.created_at.isoformat() if c.created_at else None} for c in camps]})
 
 @campaigns_bp.route('', methods=['POST'])
 @token_required
 def create_campaign():
     data = request.get_json() or {}
-    c = Campaign(name=data.get('name',''), description=data.get('description',''),
-                 election_date=datetime.datetime.strptime(data['election_date'],'%Y-%m-%d').date() if data.get('election_date') else None,
-                 region=data.get('region',''), commune=data.get('commune',''), created_by=request.current_user.id)
+    c = Campaign(
+        name=data.get('name',''),
+        description=data.get('description',''),
+        election_date=datetime.datetime.strptime(data['election_date'],'%Y-%m-%d').date() if data.get('election_date') else None,
+        election_type=data.get('election_type',''),
+        region=data.get('region',''),
+        commune=data.get('commune',''),
+        price=data.get('price',0),
+        pricing_model=data.get('pricing_model','forfait'),
+        created_by=request.current_user.id
+    )
     db.session.add(c); db.session.commit()
     return jsonify({'status':'success','campaign':{'id':c.id,'name':c.name}}), 201
 
@@ -367,7 +397,7 @@ def get_campaign():
     if not cid: return jsonify({'status':'error','message':'id requis'}), 400
     c = Campaign.query.get(cid)
     if not c: return jsonify({'status':'error','message':'Campagne introuvable'}), 404
-    return jsonify({'status':'success','campaign':{'id':c.id,'name':c.name,'description':c.description,'election_date':str(c.election_date) if c.election_date else None,'region':c.region,'commune':c.commune,'status':c.status,'created_by':c.created_by,'created_at':c.created_at.isoformat() if c.created_at else None}})
+    return jsonify({'status':'success','campaign':{'id':c.id,'name':c.name,'description':c.description,'election_date':str(c.election_date) if c.election_date else None,'election_type':c.election_type,'region':c.region,'commune':c.commune,'status':c.status,'price':float(c.price) if c.price else 0,'pricing_model':c.pricing_model,'created_by':c.created_by,'created_at':c.created_at.isoformat() if c.created_at else None}})
 
 @campaigns_bp.route('/update', methods=['POST'])
 @token_required
@@ -379,7 +409,10 @@ def update_campaign():
     if not c: return jsonify({'status':'error','message':'Campagne introuvable'}), 404
     c.name = data.get('name', c.name); c.description = data.get('description', c.description)
     if data.get('election_date'): c.election_date = datetime.datetime.strptime(data['election_date'],'%Y-%m-%d').date()
+    c.election_type = data.get('election_type', c.election_type)
     c.region = data.get('region', c.region); c.commune = data.get('commune', c.commune); c.status = data.get('status', c.status)
+    c.price = data.get('price', c.price)
+    c.pricing_model = data.get('pricing_model', c.pricing_model)
     db.session.commit()
     return jsonify({'status':'success','campaign':{'id':c.id,'name':c.name}})
 
@@ -453,8 +486,10 @@ def shop_list_products():
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', 20, type=int)
     cat = request.args.get('category', '')
+    search = request.args.get('search', '').strip()
     q = Product.query
     if cat: q = q.filter_by(category=cat)
+    if search: q = q.filter(Product.name.ilike(f'%{search}%'))
     q = q.order_by(Product.created_at.desc())
     total = q.count()
     products = q.offset((page-1)*per_page).limit(per_page).all()
@@ -556,7 +591,7 @@ def shop_clear_cart():
 @token_required
 def shop_list_orders():
     page = request.args.get('page', 1, type=int)
-    per_page = request.args.get('per_page', 10, type=int)
+    per_page = request.args.get('per_page', request.args.get('limit', 10, type=int), type=int)
     q = Order.query.order_by(Order.created_at.desc())
     total = q.count()
     orders = q.offset((page-1)*per_page).limit(per_page).all()
@@ -1235,7 +1270,7 @@ app.register_blueprint(shop_bp)
 
 @app.route('/')
 def index():
-    return jsonify({'service':'Coalition 509 API','version':'2.9.5','status':'ok','modules':['auth','campaigns','users','orders','bot','shop']})
+    return jsonify({'service':'Coalition 509 API','version':'2.9.6','status':'ok','modules':['auth','campaigns','users','orders','bot','shop']})
 
 def auto_migrate():
     try:
@@ -1271,6 +1306,31 @@ def auto_migrate():
                 print("[MIGRATE] Colonne 'delivery_phone' ajoutee a deliveries")
             else:
                 print("[MIGRATE] Colonne 'delivery_phone' deja presente")
+
+            # Nouvelles colonnes Campaign v2.9.6
+            result5 = conn.execute(db.text("SELECT column_name FROM information_schema.columns WHERE table_name='campaigns' AND column_name='election_type'"))
+            if not result5.fetchone():
+                conn.execute(db.text("ALTER TABLE campaigns ADD COLUMN election_type VARCHAR(50)"))
+                conn.commit()
+                print("[MIGRATE] Colonne 'election_type' ajoutee a campaigns")
+            else:
+                print("[MIGRATE] Colonne 'election_type' deja presente")
+
+            result6 = conn.execute(db.text("SELECT column_name FROM information_schema.columns WHERE table_name='campaigns' AND column_name='price'"))
+            if not result6.fetchone():
+                conn.execute(db.text("ALTER TABLE campaigns ADD COLUMN price NUMERIC(12,2) DEFAULT 0"))
+                conn.commit()
+                print("[MIGRATE] Colonne 'price' ajoutee a campaigns")
+            else:
+                print("[MIGRATE] Colonne 'price' deja presente")
+
+            result7 = conn.execute(db.text("SELECT column_name FROM information_schema.columns WHERE table_name='campaigns' AND column_name='pricing_model'"))
+            if not result7.fetchone():
+                conn.execute(db.text("ALTER TABLE campaigns ADD COLUMN pricing_model VARCHAR(20) DEFAULT 'forfait'"))
+                conn.commit()
+                print("[MIGRATE] Colonne 'pricing_model' ajoutee a campaigns")
+            else:
+                print("[MIGRATE] Colonne 'pricing_model' deja presente")
     except Exception as e:
         print(f"[MIGRATE] {e}")
 
