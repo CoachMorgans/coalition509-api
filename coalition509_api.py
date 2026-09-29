@@ -1,11 +1,19 @@
 """
-Coalition 509 API — Backend v2.9.6
+Coalition 509 API — Backend v2.9.7
+v2.9.7 (29/09/2026) — SÉCURITÉ :
+  1. Jeton de session signé (itsdangerous, 30 jours) au lieu du numéro de téléphone.
+     Avant : connaître un numéro suffisait pour agir au nom de son titulaire (y compris admin).
+  2. Lien de connexion du Bot Challenger (bot_auth) réellement vérifié (HMAC, validité 30 min).
+     Avant : la signature n'était jamais contrôlée.
+  3. /api/init-db et /api/seed (effacement de la base) protégés par ADMIN_RESET_KEY.
+     Avant : une simple visite de l'URL effaçait toutes les données.
 Module SHOP intégré : Produits, Panier, Commandes, Fournisseurs, Livraisons, Paiements, Factures, Stocks
 Fix : teardown session + rollback stats + SSL EOF robustness
 RÈGLE D'OR : pas de chevrons <> dans les routes Flask — query params uniquement
 """
 
-import os, uuid, hashlib, datetime, time, re
+import os, uuid, hashlib, hmac, datetime, time, re
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from functools import wraps
 from flask import Flask, request, jsonify, Blueprint
 from flask_sqlalchemy import SQLAlchemy
@@ -15,6 +23,8 @@ app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'postgresql://localhost/coalition509')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'coalition509-dev-secret')
+if app.config['SECRET_KEY'] == 'coalition509-dev-secret':
+    print("[SECURITE] ⚠️ SECRET_KEY par défaut (publique sur GitHub) — définissez SECRET_KEY dans Render → Environment")
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {'pool_pre_ping': True, 'pool_recycle': 300}
 db = SQLAlchemy(app)
 CORS(app)
@@ -185,6 +195,56 @@ class StockMovement(db.Model):
 # UTILITAIRES
 # ============================================================
 def hash_pin(pin): return hashlib.sha256(pin.encode()).hexdigest()
+# ── Jetons de session signés (v2.9.7) ──────────────────────
+SESSION_MAX_AGE = int(os.environ.get('SESSION_MAX_AGE', 30 * 24 * 3600))  # 30 jours
+def _session_serializer():
+    return URLSafeTimedSerializer(app.config['SECRET_KEY'], salt='c509-session-v1')
+def make_session_token(user):
+    return _session_serializer().dumps({'u': user.id, 'p': user.phone})
+def user_from_session_token(token):
+    """Renvoie l'utilisateur si le jeton est authentique et non expiré, sinon None."""
+    try:
+        data = _session_serializer().loads(token, max_age=SESSION_MAX_AGE)
+    except (BadSignature, SignatureExpired):
+        return None
+    if not isinstance(data, dict): return None
+    user = db.session.get(User, data.get('u'))
+    if not user or user.phone != data.get('p'): return None
+    return user
+
+# ── Liens de connexion du Bot Challenger (v2.9.7) ─────────
+# Format inchangé pour le bot : "<téléphone>|<32 hex>". La signature dépend
+# d'une fenêtre de 10 minutes ; un lien reste valable 3 fenêtres (≤ 30 min).
+BOT_LINK_WINDOW = 600
+BOT_LINK_WINDOWS_OK = 3
+def _bot_link_sig(phone, window):
+    msg = f"bot-link|{phone}|{window}".encode()
+    return hmac.new(app.config['SECRET_KEY'].encode(), msg, hashlib.sha256).hexdigest()[:32]
+def make_bot_link_token(phone):
+    return f"{phone}|{_bot_link_sig(phone, int(time.time() // BOT_LINK_WINDOW))}"
+def verify_bot_link_token(token):
+    """Renvoie le téléphone normalisé si le lien est authentique et récent, sinon None."""
+    if not token or '|' not in token: return None
+    raw_phone, sig = token.rsplit('|', 1)
+    phone = normaliser_tel(raw_phone)
+    if not phone or len(sig) != 32: return None
+    now_w = int(time.time() // BOT_LINK_WINDOW)
+    for w in range(now_w, now_w - BOT_LINK_WINDOWS_OK, -1):
+        if hmac.compare_digest(sig, _bot_link_sig(phone, w)):
+            return phone
+    return None
+
+# ── Protection des routes d'effacement (v2.9.7) ───────────
+def reset_key_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        expected = os.environ.get('ADMIN_RESET_KEY', '')
+        given = request.headers.get('X-Admin-Reset-Key', '') or request.args.get('key', '')
+        if len(expected) < 16 or not hmac.compare_digest(given, expected):
+            return jsonify({'status':'error','message':'Opération désactivée ou clé invalide'}), 403
+        return f(*args, **kwargs)
+    return decorated
+
 def generate_ngd_id(): return f"NGD-{datetime.datetime.now().year}-{uuid.uuid4().hex[:6].upper()}"
 def generate_order_number(): return f"CMD-{str(uuid.uuid4().int % 10000).zfill(3)}"
 def generate_invoice_number(): return f"FAC-{datetime.datetime.now().year}-{str(uuid.uuid4().int % 10000).zfill(4)}"
@@ -201,9 +261,9 @@ def token_required(f):
                 token = request.args.get('access_token')
             if not token:
                 return jsonify({'status':'error','message':'Token manquant'}), 401
-            user = User.query.filter_by(phone=token).first()
+            user = user_from_session_token(token)
             if not user:
-                return jsonify({'status':'error','message':'Token invalide'}), 401
+                return jsonify({'status':'error','message':'Session invalide ou expirée — reconnectez-vous'}), 401
             request.current_user = user
             return f(*args, **kwargs)
         except Exception as e:
@@ -280,7 +340,8 @@ def login():
         return jsonify({'status':'error','message':'Identifiants invalides'}), 401
     if user.status != 'active':
         return jsonify({'status':'error','message':'Compte inactif'}), 403
-    return jsonify({'status':'success','token':user.phone,'access_token':user.phone,'user':{'id':user.id,'phone':user.phone,'first_name':user.first_name,'last_name':user.last_name,'email':user.email,'role':user.role,'region':user.region,'commune':user.commune,'profile_type':user.profile_type,'ngd_id':user.ngd_id}})
+    tok = make_session_token(user)
+    return jsonify({'status':'success','token':tok,'access_token':tok,'user':{'id':user.id,'phone':user.phone,'first_name':user.first_name,'last_name':user.last_name,'email':user.email,'role':user.role,'region':user.region,'commune':user.commune,'profile_type':user.profile_type,'ngd_id':user.ngd_id}})
 
 @auth_bp.route('/register', methods=['POST'])
 def register():
@@ -298,7 +359,8 @@ def register():
                 region=data.get('region',''), commune=data.get('commune',''),
                 profile_type=data.get('profile_type','Animateur NGD'), ngd_id=generate_ngd_id())
     db.session.add(user); db.session.commit()
-    return jsonify({'status':'success','token':user.phone,'access_token':user.phone,'id':user.id,'ngd_id':user.ngd_id,'user':{'id':user.id,'phone':user.phone,'first_name':user.first_name,'last_name':user.last_name,'email':user.email,'role':user.role,'region':user.region,'commune':user.commune,'profile_type':user.profile_type,'ngd_id':user.ngd_id}}), 201
+    tok = make_session_token(user)
+    return jsonify({'status':'success','token':tok,'access_token':tok,'id':user.id,'ngd_id':user.ngd_id,'user':{'id':user.id,'phone':user.phone,'first_name':user.first_name,'last_name':user.last_name,'email':user.email,'role':user.role,'region':user.region,'commune':user.commune,'profile_type':user.profile_type,'ngd_id':user.ngd_id}}), 201
 
 @auth_bp.route('/me', methods=['GET'])
 @token_required
@@ -313,10 +375,14 @@ def verify_bot_token():
     if not bot_token:
         return jsonify({'ok':False,'error':'Token manquant'}), 400
     try:
-        phone = normaliser_tel(bot_token.split('|')[0] if '|' in bot_token else bot_token)
+        phone = verify_bot_link_token(bot_token)
+        if not phone:
+            return jsonify({'ok':False,'error':'Lien de connexion invalide ou expiré (validité 30 min) — rouvrez « Élections » dans le bot'})
         user = User.query.filter_by(phone=phone).first()
+        if user and user.status != 'active':
+            return jsonify({'ok':False,'error':'Compte inactif — contactez un administrateur'})
         if user:
-            return jsonify({'ok':True,'access_token':user.phone,'user':{'id':user.id,'phone':user.phone,'first_name':user.first_name,'last_name':user.last_name,'email':user.email,'role':user.role,'region':user.region,'commune':user.commune,'profile_type':user.profile_type,'ngd_id':user.ngd_id}})
+            return jsonify({'ok':True,'access_token':make_session_token(user),'user':{'id':user.id,'phone':user.phone,'first_name':user.first_name,'last_name':user.last_name,'email':user.email,'role':user.role,'region':user.region,'commune':user.commune,'profile_type':user.profile_type,'ngd_id':user.ngd_id}})
         else:
             return jsonify({'ok':True,'needs_registration':True,'phone':phone})
     except Exception as e:
@@ -1063,9 +1129,7 @@ def generate_bot_token():
         data = request.get_json() or {}
         phone = normaliser_tel(data.get('phone',''))
         if not phone: return jsonify({'status':'error','message':'Phone requis'}), 400
-        token_raw = f"{phone}|{int(time.time())}|{app.config['SECRET_KEY']}"
-        token = hashlib.sha256(token_raw.encode()).hexdigest()[:32]
-        return jsonify({'token':f"{phone}|{token}"})
+        return jsonify({'token': make_bot_link_token(phone)})
     except Exception as e:
         db.session.rollback()
         import traceback
@@ -1077,7 +1141,8 @@ def generate_bot_token():
 # ============================================================
 init_bp = Blueprint('init', __name__, url_prefix='/api')
 
-@init_bp.route('/init-db', methods=['GET'])
+@init_bp.route('/init-db', methods=['GET','POST'])
+@reset_key_required
 def init_db():
     try:
         db.drop_all(); db.create_all()
@@ -1089,6 +1154,7 @@ def init_db():
 seed_bp = Blueprint('seed', __name__, url_prefix='/api')
 
 @seed_bp.route('/seed', methods=['GET','POST'])
+@reset_key_required
 def seed():
     try:
         db.session.query(StockMovement).delete(); db.session.query(Invoice).delete()
@@ -1270,7 +1336,7 @@ app.register_blueprint(shop_bp)
 
 @app.route('/')
 def index():
-    return jsonify({'service':'Coalition 509 API','version':'2.9.6','status':'ok','modules':['auth','campaigns','users','orders','bot','shop']})
+    return jsonify({'service':'Coalition 509 API','version':'2.9.7','status':'ok','modules':['auth','campaigns','users','orders','bot','shop']})
 
 def auto_migrate():
     try:
@@ -1336,7 +1402,7 @@ def auto_migrate():
 
 with app.app_context():
     db.create_all()
-    print("[BOOT] Tables verifiees/creees v2.9.5")
+    print("[BOOT] Tables verifiees/creees v2.9.7")
     auto_migrate()
 
 if __name__ == '__main__':
