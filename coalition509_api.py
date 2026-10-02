@@ -1,5 +1,11 @@
 """
-Coalition 509 API — Backend v2.9.7
+Coalition 509 API — Backend v2.9.8
+v2.9.8 (02/10/2026) — PLACE DE MARCHÉ :
+  1. Catalogue de démonstration aligné sur les prix réels en ligne (10 produits, 5 000 à 500 000 FCFA).
+  2. Guichet GET /api/stats-partenaires (en-tête X-Stats-Key = STATS_KEY) pour le Hub Partenaires :
+     ventes payées par jour, volume brut et revenu net VoteConnect.
+     Revenu net : 100 % pour les prestations vendues en propre (VC_PRODUITS_PROPRES),
+     COMMISSION_PCT % (10 par défaut) pour les produits livrés par les fournisseurs.
 v2.9.7 (29/09/2026) — SÉCURITÉ :
   1. Jeton de session signé (itsdangerous, 30 jours) au lieu du numéro de téléphone.
      Avant : connaître un numéro suffisait pour agir au nom de son titulaire (y compris admin).
@@ -1199,16 +1205,16 @@ def seed():
         db.session.add_all([s1,s2]); db.session.commit()
 
         products_data = [
-            ('Affiche A3 (lot 100)', 'Affiches électorales haute qualité format A3', 'imprimerie', 3500, 20, s2.id, 'https://i.ibb.co/LdqjWMGL/Affiche-A3-Saa-S.png'),
-            ('Brainstorming Session', 'Session de brainstorming stratégique 2h', 'service', 15000, 999, s1.id, 'https://i.ibb.co/xS5k3rxH/Brainstorming-Saa-S.png'),
-            ('Casquette Coalition 509', 'Casquette brodée logo officiel', 'textile', 1500, 30, s1.id, 'https://i.ibb.co/DP6hYrPx/Casquettes-Saa-S.png'),
-            ('Flyers A5 (lot 500)', 'Flyers recto/verso couleur', 'imprimerie', 2000, 100, s2.id, 'https://i.ibb.co/1fgqRWQm/Flyers-Saa-S.png'),
+            ('Affiche A3 (lot 100)', 'Affiches électorales haute qualité format A3', 'imprimerie', 100000, 20, s2.id, 'https://i.ibb.co/LdqjWMGL/Affiche-A3-Saa-S.png'),
+            ('Brainstorming Session', 'Session de brainstorming stratégique 2h', 'service', 500000, 999, s1.id, 'https://i.ibb.co/xS5k3rxH/Brainstorming-Saa-S.png'),
+            ('Casquette Coalition 509', 'Casquette brodée logo officiel', 'textile', 5000, 30, s1.id, 'https://i.ibb.co/DP6hYrPx/Casquettes-Saa-S.png'),
+            ('Flyers A5 (lot 500)', 'Flyers recto/verso couleur', 'imprimerie', 35000, 100, s2.id, 'https://i.ibb.co/1fgqRWQm/Flyers-Saa-S.png'),
             ('Pack Hôtel Électoral', 'Réservation hôtel + transport pour équipe', 'service', 75000, 50, s1.id, 'https://i.ibb.co/8DcPN4w9/H-tel-Saa-S.png'),
             ('Pack Locomotion', 'Location véhicule + carburant journée', 'service', 45000, 30, s1.id, 'https://i.ibb.co/jPPNBQ3T/Locomotion-Saa-S.png'),
-            ('Personal Branding', 'Kit photo + CV politique + réseaux', 'service', 25000, 100, s2.id, 'https://i.ibb.co/ynLW4hpC/Personnal-Branding-Saa-S.png'),
-            ('Podcast Campagne', 'Production podcast 3 épisodes', 'service', 35000, 20, s2.id, 'https://i.ibb.co/vbdGJqr/Podcast-Saa-S.png'),
-            ('Pack Restaurant', 'Traiteur 50 personnes + mobilier', 'service', 125000, 10, s1.id, 'https://i.ibb.co/ZzHFc5H9/Restaurant-Saa-S.png'),
-            ('T-Shirt Coalition 509', 'T-shirt officiel 100% coton', 'textile', 2500, 50, s1.id, 'https://i.ibb.co/QFsDrWqZ/T-Shirts-Saa-S.png'),
+            ('Personal Branding', 'Kit photo + CV politique + réseaux', 'service', 350000, 100, s2.id, 'https://i.ibb.co/ynLW4hpC/Personnal-Branding-Saa-S.png'),
+            ('Podcast Campagne', 'Production podcast 3 épisodes', 'service', 200000, 20, s2.id, 'https://i.ibb.co/vbdGJqr/Podcast-Saa-S.png'),
+            ('Pack Restaurant', 'Traiteur 50 personnes + mobilier', 'service', 135000, 10, s1.id, 'https://i.ibb.co/ZzHFc5H9/Restaurant-Saa-S.png'),
+            ('T-Shirt Coalition 509', 'T-shirt officiel 100% coton', 'textile', 5000, 50, s1.id, 'https://i.ibb.co/QFsDrWqZ/T-Shirts-Saa-S.png'),
         ]
         for name, desc, cat, price, stock, supp_id, img in products_data:
             db.session.add(Product(name=name, description=desc, category=cat, price=price, stock_quantity=stock, supplier_id=supp_id, status='active', image_url=img))
@@ -1323,6 +1329,78 @@ def v1_bot_stats_history(): return bot_stats_history()
 # ============================================================
 # REGISTREMENT BLUEPRINTS
 # ============================================================
+
+# ============================================================
+# GUICHET STATISTIQUES — HUB PARTENAIRES (v2.9.8)
+# GET /api/stats-partenaires?du=AAAA-MM-JJ&au=AAAA-MM-JJ  —  en-tête X-Stats-Key
+# Lecture seule, aucune donnée personnelle.
+# ============================================================
+STATS_KEY = os.environ.get('STATS_KEY', '')
+COMMISSION_PCT = float(os.environ.get('COMMISSION_PCT', '10') or 0)
+VC_PRODUITS_PROPRES = [x.strip().lower() for x in os.environ.get(
+    'VC_PRODUITS_PROPRES', 'Podcast Campagne,Personal Branding,Brainstorming Session').split(',') if x.strip()]
+
+def part_voteconnect(nom_produit):
+    """Part du prix qui revient à VoteConnect SARL (1.0 = prestation vendue en propre)."""
+    if (nom_produit or '').strip().lower() in VC_PRODUITS_PROPRES: return 1.0
+    return COMMISSION_PCT / 100.0
+
+def _stats_cle_valide(fournie):
+    attendue = STATS_KEY or ''
+    return len(attendue) >= 16 and hmac.compare_digest(fournie or '', attendue)
+
+def _periode(du, au):
+    try:
+        d = datetime.datetime.strptime(du, '%Y-%m-%d').date(); a = datetime.datetime.strptime(au, '%Y-%m-%d').date()
+    except (TypeError, ValueError):
+        return None
+    if d > a: d, a = a, d
+    if (a - d).days > 366: return None
+    return d, a
+
+@app.route('/api/stats-partenaires', methods=['GET'])
+def stats_partenaires():
+    if not STATS_KEY: return jsonify({'ok': False, 'error': 'Guichet désactivé (STATS_KEY absent).'}), 503
+    if not _stats_cle_valide(request.headers.get('X-Stats-Key', '')): return jsonify({'ok': False, 'error': 'non autorisé'}), 401
+    per = _periode(request.args.get('du', ''), request.args.get('au', ''))
+    if not per: return jsonify({'ok': False, 'error': 'Période invalide (AAAA-MM-JJ, 366 jours maximum).'}), 400
+    du, au = per
+    try:
+        debut = datetime.datetime.combine(du, datetime.time.min); fin = datetime.datetime.combine(au + datetime.timedelta(days=1), datetime.time.min)
+        acc = {}
+        def cumuler(date, flux, region, brut, net, nb=1):
+            k = (date, flux, region)
+            l = acc.setdefault(k, {'date': date, 'flux': flux, 'type': 'REVENU', 'region': region, 'brut': 0.0, 'net': 0.0, 'nb': 0})
+            l['brut'] += brut; l['net'] += net; l['nb'] += nb
+        commandes = Order.query.filter(Order.payment_status == 'paid').all()
+        for o in commandes:
+            inv = Invoice.query.filter_by(order_id=o.id).first()
+            quand = (inv.paid_at if inv and inv.paid_at else None) or o.created_at
+            if not quand or quand < debut or quand >= fin: continue
+            jour = quand.strftime('%Y-%m-%d'); region = o.region or ''
+            items = OrderItem.query.filter_by(order_id=o.id).all()
+            if not items:
+                cumuler(jour, 'Place de marché — fournisseurs', region, float(o.total_amount or 0), float(o.total_amount or 0) * COMMISSION_PCT / 100.0)
+                continue
+            for it in items:
+                p = db.session.get(Product, it.product_id)
+                brut = float(it.total_price or 0) or float(it.unit_price or 0) * (it.quantity or 1)
+                part = part_voteconnect(p.name if p else '')
+                flux = 'Place de marché — prestations VoteConnect' if part >= 1 else f'Place de marché — fournisseurs ({COMMISSION_PCT:g} %)'
+                cumuler(jour, flux, region, brut, brut * part)
+        lignes = sorted(acc.values(), key=lambda l: (l['date'], l['flux']))
+        for l in lignes: l['brut'] = round(l['brut']); l['net'] = round(l['net'])
+        indicateurs = {
+            'Produits au catalogue': Product.query.filter_by(status='active').count(),
+            'Commandes en attente de paiement': Order.query.filter_by(payment_status='pending').count(),
+            'Commission fournisseurs': f'{COMMISSION_PCT:g} %',
+        }
+        return jsonify({'ok': True, 'service': 'coalition509-api', 'version': '2.9.8', 'periode': {'du': str(du), 'au': str(au)}, 'lignes': lignes, 'indicateurs': indicateurs})
+    except Exception as e:
+        db.session.rollback()
+        print(f"[STATS-PARTENAIRES] {e}")
+        return jsonify({'ok': False, 'error': 'erreur interne'}), 500
+
 app.register_blueprint(auth_bp)
 app.register_blueprint(users_bp)
 app.register_blueprint(campaigns_bp)
@@ -1336,7 +1414,7 @@ app.register_blueprint(shop_bp)
 
 @app.route('/')
 def index():
-    return jsonify({'service':'Coalition 509 API','version':'2.9.7','status':'ok','modules':['auth','campaigns','users','orders','bot','shop']})
+    return jsonify({'service':'Coalition 509 API','version':'2.9.8','status':'ok','modules':['auth','campaigns','users','orders','bot','shop']})
 
 def auto_migrate():
     try:
@@ -1402,7 +1480,7 @@ def auto_migrate():
 
 with app.app_context():
     db.create_all()
-    print("[BOOT] Tables verifiees/creees v2.9.7")
+    print("[BOOT] Tables verifiees/creees v2.9.8")
     auto_migrate()
 
 if __name__ == '__main__':
