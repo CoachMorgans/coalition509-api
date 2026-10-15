@@ -1,5 +1,7 @@
 """
-Coalition 509 API — Backend v2.11.0
+Coalition 509 API — Backend v2.11.1
+v2.11.1 (15/10/2026) — Compteur « Utilisateurs actifs » (tableau de bord) : ne compte plus que les comptes actifs
+  (les 9 comptes de démonstration désactivés étaient encore comptés).
 v2.11.0 (15/10/2026) — CANDIDATS TÊTES DE LISTE :
   1. POST /api/users/promote (Gestionnaire seul) : un compte devient « Candidat Tête de liste » (rôle admin)
      avec sa candidature (liste / circonscription) et une confirmation explicite → accès à la Boutique.
@@ -1402,7 +1404,7 @@ stats_bp = Blueprint('stats', __name__, url_prefix='/api/stats')
 @token_required
 def stats_overview():
     try:
-        total_users = User.query.count(); total_campaigns = Campaign.query.filter_by(status='active').count(); total_orders = Order.query.count()
+        total_users = User.query.filter(db.or_(User.status == 'active', User.status.is_(None))).count(); total_campaigns = Campaign.query.filter_by(status='active').count(); total_orders = Order.query.count()
         pending_orders = Order.query.filter_by(payment_status='pending').count()
         paid_orders = Order.query.filter_by(payment_status='paid').count()
         declared_orders = Order.query.filter_by(payment_status='declared').count()
@@ -1598,7 +1600,7 @@ def v1_verify_bot_token(): return verify_bot_token()
 @token_required
 def v1_dashboard_stats():
     try:
-        total_users = User.query.count(); total_campaigns = Campaign.query.filter_by(status='active').count(); total_orders = Order.query.count()
+        total_users = User.query.filter(db.or_(User.status == 'active', User.status.is_(None))).count(); total_campaigns = Campaign.query.filter_by(status='active').count(); total_orders = Order.query.count()
         pending_orders = Order.query.filter_by(payment_status='pending').count()
         paid_orders = Order.query.filter_by(payment_status='paid').count()
         declared_orders = Order.query.filter_by(payment_status='declared').count()
@@ -1751,7 +1753,7 @@ def stats_partenaires():
             'Paiements Wave à vérifier': Order.query.filter_by(payment_status='declared').count(),
             'Commission fournisseurs': f'{COMMISSION_PCT:g} %',
         }
-        return jsonify({'ok': True, 'service': 'coalition509-api', 'version': '2.11.0', 'periode': {'du': str(du), 'au': str(au)}, 'lignes': lignes, 'indicateurs': indicateurs})
+        return jsonify({'ok': True, 'service': 'coalition509-api', 'version': '2.11.1', 'periode': {'du': str(du), 'au': str(au)}, 'lignes': lignes, 'indicateurs': indicateurs})
     except Exception as e:
         db.session.rollback()
         print(f"[STATS-PARTENAIRES] {e}")
@@ -1770,7 +1772,7 @@ app.register_blueprint(shop_bp)
 
 @app.route('/')
 def index():
-    return jsonify({'service':'Coalition 509 API','version':'2.11.0','status':'ok','modules':['auth','campaigns','users','orders','bot','shop'],'boutique':{'paiement':'Wave — marchand Formation','gestionnaires_configures':len(GESTIONNAIRES_BOUTIQUE)}})
+    return jsonify({'service':'Coalition 509 API','version':'2.11.1','status':'ok','modules':['auth','campaigns','users','orders','bot','shop'],'boutique':{'paiement':'Wave — marchand Formation','gestionnaires_configures':len(GESTIONNAIRES_BOUTIQUE)}})
 
 def auto_migrate():
     try:
@@ -1853,7 +1855,7 @@ def auto_migrate():
 
 with app.app_context():
     db.create_all()
-    print("[BOOT] Tables verifiees/creees v2.11.0")
+    print("[BOOT] Tables verifiees/creees v2.11.1")
     auto_migrate()
     try:
         preparer_comptes()

@@ -105,10 +105,10 @@ def test_parcours_complet(ctx):
     import datetime
     jour = datetime.date.today().isoformat()
     st = j(c.get(f'/api/stats-partenaires?du={jour}&au={jour}', headers={'X-Stats-Key': os.environ['STATS_KEY']}))
-    assert st['ok'] and sum(l['brut'] for l in st['lignes']) == 10000 and st['version'] == '2.11.0'
+    assert st['ok'] and sum(l['brut'] for l in st['lignes']) == 10000 and st['version'] == '2.11.1'
     assert st['indicateurs']['Paiements Wave à vérifier'] == 0
     racine = j(c.get('/'))
-    assert racine['version'] == '2.11.0' and racine['boutique']['gestionnaires_configures'] == 6
+    assert racine['version'] == '2.11.1' and racine['boutique']['gestionnaires_configures'] == 6
 
 def test_produit_vendu_retire_sans_casser_historique(ctx):
     c, H = ctx
@@ -260,3 +260,14 @@ def test_seed_conserve_officiels_et_cree_demos_inactifs(ctx):
         assert len(demos) == 9 and all(u.status == 'inactive' and u.role == 'user' for u in demos)
     assert c.post('/api/auth/login', json={'phone': '+2250707777701', 'pin': '1234'}).status_code == 403
     assert c.post('/api/auth/login', json={'phone': '0505761784', 'pin': '2580'}).status_code == 200
+
+def test_compteur_utilisateurs_actifs(ctx):
+    c, H = ctx
+    with app.app_context():
+        db.session.add(api.User(phone='002250700000099', pin_hash=api.hash_pin('1234'), role='user', status='inactive', ngd_id=api.generate_ngd_id()))
+        db.session.commit()
+        actifs = api.User.query.filter_by(status='active').count(); total = api.User.query.count()
+    assert total > actifs
+    T = {'Authorization': 'Bearer ' + j(c.post('/api/auth/login', json={'phone': '0505761784', 'pin': '2580'}))['token']}   # compte officiel (conservé par /api/seed)
+    assert j(c.get('/api/v1/dashboard/stats', headers=T))['total_users'] == actifs
+    assert j(c.get('/api/stats/overview', headers=T))['stats']['total_users'] == actifs
