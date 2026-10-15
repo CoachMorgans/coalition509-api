@@ -1,5 +1,44 @@
 """
-Coalition 509 API — Backend v2.9.8
+Coalition 509 API — Backend v2.11.0
+v2.11.0 (15/10/2026) — CANDIDATS TÊTES DE LISTE :
+  1. POST /api/users/promote (Gestionnaire seul) : un compte devient « Candidat Tête de liste » (rôle admin)
+     avec sa candidature (liste / circonscription) et une confirmation explicite → accès à la Boutique.
+  2. POST /api/users/demote (Gestionnaire seul) : retrait du statut, motif obligatoire ; effet immédiat
+     (le rôle est relu à chaque requête). Impossible sur son propre compte ou sur un superadmin.
+  3. GET /api/users/role-history (Gestionnaire seul) : journal des promotions et retraits (table role_changes).
+  4. Annuaire des utilisateurs (GET /api/users, /api/v1/users) : réservé aux Candidats et au Gestionnaire
+     (un citoyen pouvait lire tous les numéros) ; filtres role= et search=, « limit » accepté (max 200).
+     Export CSV /api/v1/export/users : Gestionnaire seul. Export CSV des commandes : chacun les siennes,
+     le Gestionnaire toutes (il livrait toutes les commandes à n'importe quel compte connecté).
+  5. Migration automatique : colonnes candidature, promoted_at, promoted_by sur users.
+  6. COMPTES OFFICIELS VoteConnect inscrits dans le code (COMPTES_OFFICIELS) : 07 07 78 66 14, 07 67 56 09 08,
+     07 87 10 21 90, 05 05 76 17 84 — Admin (Candidat Tête de liste) ET Gestionnaire, quel que soit le format saisi
+     (0707…, +225 07…, 00225 07…). Rôle admin appliqué au démarrage, à l'inscription, à la connexion et au lien du bot.
+     Leur statut ne peut pas être retiré depuis le tableau de bord. GESTIONNAIRES_BOUTIQUE (Render) AJOUTE des délégués.
+  7. Comptes de DÉMONSTRATION (00225 07 07 77 77 01 à 09, PIN 1234 public dans le code) : désactivés au démarrage
+     (rôle user, statut inactif) ; /api/seed les recrée inactifs et ne supprime plus les comptes officiels.
+  8. Un compte désactivé perd immédiatement ses sessions ouvertes (le jeton est refusé).
+  9. Connexion / inscription / lien du bot : le compte est retrouvé quel que soit le format du numéro
+     (un compte créé en « 07… » se connecte aussi en « +225 07… », et ne peut plus être créé en double).
+v2.10.0 (15/10/2026) — BOUTIQUE SÉCURISÉE (paiement Wave vérifié) :
+  1. Boutique réservée aux Candidats Têtes de liste (rôle admin) et aux Gestionnaires VoteConnect
+     (numéro listé dans GESTIONNAIRES_BOUTIQUE sur Render, ou rôle superadmin). Un citoyen (rôle user)
+     n'a plus accès aux routes /api/shop/*, même en appelant l'API directement.
+  2. Paiement Wave sur le marchand FORMATION (WAVE_MARCHAND_FORMATION, par défaut M_ci_QlW5ke-hYGbA) :
+     commande → lien Wave (montant pré-rempli) → RÉFÉRENCE Wave obligatoire (POST /api/shop/orders/declare-payment,
+     6 à 30 caractères A-Z0-9, unique) → validation ou rejet par le Gestionnaire (POST /api/shop/orders/validate-payment)
+     après contrôle dans l'application Wave.
+  3. À la validation seulement : stock retiré, facture « payée », livraison lancée (awaiting_payment → pending).
+     Vérification du stock à l'ajout au panier, à la commande et à la validation.
+  4. Portes fermées : /api/orders/pay, /api/v1/payments/init et /api/v1/payments/confirm répondent 410 (ils marquaient
+     une commande « payée » sans argent, pour n'importe quel utilisateur connecté). orders/update et invoices/update ne
+     peuvent plus mettre « payé ». Une commande payée ou déclarée ne se supprime plus.
+  5. Chaque Candidat ne voit que ses commandes, factures et livraisons ; le Gestionnaire voit tout.
+     Catalogue, fournisseurs, stocks et livraisons : Gestionnaire seul.
+  6. Annulation d'une commande non payée : POST /api/shop/orders/cancel.
+  7. Profil (login, me, lien du bot) : champs « gestionnaire » et « acheteur » pour le tableau de bord.
+  8. Migration automatique : colonnes wave_reference, payment_declared_at, payment_validated_at,
+     payment_validated_by, payment_note sur orders.
 v2.9.8 (02/10/2026) — PLACE DE MARCHÉ :
   1. Catalogue de démonstration aligné sur les prix réels en ligne (10 produits, 5 000 à 500 000 FCFA).
   2. Guichet GET /api/stats-partenaires (en-tête X-Stats-Key = STATS_KEY) pour le Hub Partenaires :
@@ -66,6 +105,22 @@ class User(db.Model):
     profile_type = db.Column(db.String(50))
     ngd_id = db.Column(db.String(50), unique=True)
     created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    # v2.11.0 — Candidat Tête de liste
+    candidature = db.Column(db.String(150))          # ex. « Coalition Bélier — Conseil Régional du Bélier »
+    promoted_at = db.Column(db.DateTime)
+    promoted_by = db.Column(db.Integer)
+
+class RoleChange(db.Model):
+    # v2.11.0 — journal des promotions / retraits du statut Candidat Tête de liste
+    __tablename__ = 'role_changes'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, index=True, nullable=False)
+    old_role = db.Column(db.String(20))
+    new_role = db.Column(db.String(20))
+    candidature = db.Column(db.String(150))
+    motif = db.Column(db.Text)
+    by_user_id = db.Column(db.Integer)
+    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
 
 class Campaign(db.Model):
     __tablename__ = 'campaigns'
@@ -95,6 +150,12 @@ class Order(db.Model):
     region = db.Column(db.String(50))
     commune = db.Column(db.String(50))
     created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    # v2.10.0 — paiement Wave vérifié
+    wave_reference = db.Column(db.String(40), index=True)
+    payment_declared_at = db.Column(db.DateTime)
+    payment_validated_at = db.Column(db.DateTime)
+    payment_validated_by = db.Column(db.Integer)
+    payment_note = db.Column(db.Text)
 
 class BotMessage(db.Model):
     __tablename__ = 'bot_messages'
@@ -216,6 +277,7 @@ def user_from_session_token(token):
     if not isinstance(data, dict): return None
     user = db.session.get(User, data.get('u'))
     if not user or user.phone != data.get('p'): return None
+    if (user.status or 'active') != 'active': return None   # v2.11.0 : compte désactivé → sessions refusées
     return user
 
 # ── Liens de connexion du Bot Challenger (v2.9.7) ─────────
@@ -286,6 +348,95 @@ def admin_required(f):
         return f(*args, **kwargs)
     return decorated
 
+# ── v2.10.0 : Boutique — accès et paiement Wave ─────────────
+def cle_tel(t):
+    # Clé de comparaison : les 10 chiffres du numéro ivoirien, quel que soit le format (0707…, +225 07…, 00225 07…)
+    d = re.sub(r'\D', '', str(t or ''))
+    if d.startswith('00'): d = d[2:]
+    if d.startswith('225') and len(d) == 13: d = d[3:]
+    return d
+
+# Comptes officiels VoteConnect — Admin (Candidat Tête de liste) ET Gestionnaire de la Boutique
+COMPTES_OFFICIELS = ('0707786614', '0767560908', '0787102190', '0505761784')
+# Anciens comptes de démonstration (PIN 1234 public) : neutralisés au démarrage
+COMPTES_DEMO = tuple(f'07077777{i:02d}' for i in range(1, 10))
+GESTIONNAIRES_BOUTIQUE = {cle_tel(x) for x in COMPTES_OFFICIELS} | {cle_tel(x) for x in os.environ.get('GESTIONNAIRES_BOUTIQUE', '').split(',') if cle_tel(x)}
+WAVE_MARCHAND_FORMATION = (os.environ.get('WAVE_MARCHAND_FORMATION', 'M_ci_QlW5ke-hYGbA') or 'M_ci_QlW5ke-hYGbA').strip()
+print(f"[BOUTIQUE] {len(GESTIONNAIRES_BOUTIQUE)} Gestionnaire(s) : {len(COMPTES_OFFICIELS)} compte(s) officiel(s) + délégués Render")
+
+def est_gestionnaire(u):
+    # Gestionnaire VoteConnect : compte officiel (COMPTES_OFFICIELS), délégué listé dans GESTIONNAIRES_BOUTIQUE (Render), ou superadmin.
+    if not u: return False
+    return u.role == 'superadmin' or cle_tel(u.phone) in GESTIONNAIRES_BOUTIQUE
+
+def est_acheteur(u):
+    # Candidats Têtes de liste (rôle admin) et Gestionnaires
+    return bool(u) and (u.role in ('admin', 'superadmin') or est_gestionnaire(u))
+
+def boutique_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not hasattr(request, 'current_user') or not est_acheteur(request.current_user):
+            return jsonify({'status':'error','message':'Boutique réservée aux Candidats Têtes de liste (administrateurs).'}), 403
+        return f(*args, **kwargs)
+    return decorated
+
+def gestionnaire_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not hasattr(request, 'current_user') or not est_gestionnaire(request.current_user):
+            return jsonify({'status':'error','message':'Réservé au Gestionnaire de la Boutique (VoteConnect).'}), 403
+        return f(*args, **kwargs)
+    return decorated
+
+def lien_wave(montant):
+    try: m = int(round(float(montant or 0)))
+    except (TypeError, ValueError): m = 0
+    return f"https://pay.wave.com/m/{WAVE_MARCHAND_FORMATION}/c/ci/?amount={m}"
+
+def norm_ref_wave(r):
+    return re.sub(r'[^A-Z0-9]', '', str(r if r is not None else '').upper())
+
+def user_json(u):
+    return {'id':u.id,'phone':u.phone,'first_name':u.first_name,'last_name':u.last_name,'email':u.email,'role':u.role,
+            'region':u.region,'commune':u.commune,'profile_type':u.profile_type,'ngd_id':u.ngd_id,
+            'acheteur':est_acheteur(u),'gestionnaire':est_gestionnaire(u),'candidature':u.candidature}
+
+def trouver_par_tel(phone):
+    """Compte correspondant au numéro, quel que soit le format enregistré (0707…, 002250707…, +2250707…)."""
+    u = User.query.filter_by(phone=phone).first() if phone else None
+    if u: return u
+    k = cle_tel(phone)
+    if len(k) != 10: return None
+    return User.query.filter(User.phone.in_([k, '00225' + k, '225' + k, '+225' + k])).first()
+
+def est_officiel(u):
+    return bool(u) and cle_tel(u.phone) in {cle_tel(x) for x in COMPTES_OFFICIELS}
+
+def aligner_compte_officiel(u):
+    """Compte officiel VoteConnect : rôle admin garanti (sans commit). Renvoie True si modifié."""
+    if not est_officiel(u) or u.role in ('admin', 'superadmin'): return False
+    ancien = u.role or 'user'
+    u.role = 'admin'; u.candidature = u.candidature or 'VoteConnect — Compte officiel'
+    u.promoted_at = datetime.datetime.utcnow()
+    if u.id: db.session.add(RoleChange(user_id=u.id, old_role=ancien, new_role='admin', candidature=u.candidature,
+                                       motif='Compte officiel VoteConnect (Admin & Gestionnaire)', by_user_id=None))
+    return True
+
+def preparer_comptes():
+    """Démarrage : comptes officiels → admin ; comptes de démonstration → désactivés."""
+    demo = {cle_tel(x) for x in COMPTES_DEMO}
+    n_off = n_demo = 0
+    for u in User.query.all():
+        if aligner_compte_officiel(u): n_off += 1
+        elif cle_tel(u.phone) in demo and (u.status != 'inactive' or u.role != 'user'):
+            if u.role == 'admin':
+                db.session.add(RoleChange(user_id=u.id, old_role='admin', new_role='user', candidature=u.candidature,
+                                          motif='Compte de démonstration désactivé', by_user_id=None))
+            u.role = 'user'; u.status = 'inactive'; u.candidature = None; n_demo += 1
+    db.session.commit()
+    print(f"[COMPTES] {n_off} compte(s) officiel(s) passé(s) Admin — {n_demo} compte(s) de démonstration désactivé(s)")
+
 def build_bot_stats_response():
     try:
         today = datetime.date.today()
@@ -341,13 +492,14 @@ def login():
     pin = data.get('pin', '').strip()
     if not phone or not pin:
         return jsonify({'status':'error','message':'Phone et PIN requis'}), 400
-    user = User.query.filter_by(phone=phone).first()
+    user = trouver_par_tel(phone)
     if not user or user.pin_hash != hash_pin(pin):
         return jsonify({'status':'error','message':'Identifiants invalides'}), 401
     if user.status != 'active':
         return jsonify({'status':'error','message':'Compte inactif'}), 403
+    if aligner_compte_officiel(user): db.session.commit()
     tok = make_session_token(user)
-    return jsonify({'status':'success','token':tok,'access_token':tok,'user':{'id':user.id,'phone':user.phone,'first_name':user.first_name,'last_name':user.last_name,'email':user.email,'role':user.role,'region':user.region,'commune':user.commune,'profile_type':user.profile_type,'ngd_id':user.ngd_id}})
+    return jsonify({'status':'success','token':tok,'access_token':tok,'user':user_json(user)})
 
 @auth_bp.route('/register', methods=['POST'])
 def register():
@@ -358,21 +510,22 @@ def register():
     last_name = data.get('last_name', '').strip()
     if not phone or not pin or not first_name or not last_name:
         return jsonify({'status':'error','message':'Champs obligatoires manquants'}), 400
-    if User.query.filter_by(phone=phone).first():
+    if trouver_par_tel(phone):
         return jsonify({'status':'error','message':'Telephone deja utilise'}), 409
     user = User(phone=phone, pin_hash=hash_pin(pin), first_name=first_name, last_name=last_name,
                 email=data.get('email',''), role='user', status='active',
                 region=data.get('region',''), commune=data.get('commune',''),
                 profile_type=data.get('profile_type','Animateur NGD'), ngd_id=generate_ngd_id())
     db.session.add(user); db.session.commit()
+    if aligner_compte_officiel(user): db.session.commit()
     tok = make_session_token(user)
-    return jsonify({'status':'success','token':tok,'access_token':tok,'id':user.id,'ngd_id':user.ngd_id,'user':{'id':user.id,'phone':user.phone,'first_name':user.first_name,'last_name':user.last_name,'email':user.email,'role':user.role,'region':user.region,'commune':user.commune,'profile_type':user.profile_type,'ngd_id':user.ngd_id}}), 201
+    return jsonify({'status':'success','token':tok,'access_token':tok,'id':user.id,'ngd_id':user.ngd_id,'user':user_json(user)}), 201
 
 @auth_bp.route('/me', methods=['GET'])
 @token_required
 def me():
     u = request.current_user
-    return jsonify({'status':'success','user':{'id':u.id,'phone':u.phone,'first_name':u.first_name,'last_name':u.last_name,'email':u.email,'role':u.role,'region':u.region,'commune':u.commune,'profile_type':u.profile_type,'ngd_id':u.ngd_id}})
+    return jsonify({'status':'success','user':user_json(u)})
 
 @auth_bp.route('/verify-bot-token', methods=['POST'])
 def verify_bot_token():
@@ -384,11 +537,12 @@ def verify_bot_token():
         phone = verify_bot_link_token(bot_token)
         if not phone:
             return jsonify({'ok':False,'error':'Lien de connexion invalide ou expiré (validité 30 min) — rouvrez « Élections » dans le bot'})
-        user = User.query.filter_by(phone=phone).first()
+        user = trouver_par_tel(phone)
         if user and user.status != 'active':
             return jsonify({'ok':False,'error':'Compte inactif — contactez un administrateur'})
         if user:
-            return jsonify({'ok':True,'access_token':make_session_token(user),'user':{'id':user.id,'phone':user.phone,'first_name':user.first_name,'last_name':user.last_name,'email':user.email,'role':user.role,'region':user.region,'commune':user.commune,'profile_type':user.profile_type,'ngd_id':user.ngd_id}})
+            if aligner_compte_officiel(user): db.session.commit()
+            return jsonify({'ok':True,'access_token':make_session_token(user),'user':user_json(user)})
         else:
             return jsonify({'ok':True,'needs_registration':True,'phone':phone})
     except Exception as e:
@@ -400,22 +554,116 @@ def verify_bot_token():
 # ============================================================
 users_bp = Blueprint('users', __name__, url_prefix='/api/users')
 
+def annuaire_required(f):
+    # v2.11.0 — annuaire réservé aux Candidats Têtes de liste et au Gestionnaire (un citoyen lisait tous les numéros)
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not hasattr(request, 'current_user') or not est_acheteur(request.current_user):
+            return jsonify({'status':'error','message':'Annuaire réservé aux Candidats Têtes de liste et au Gestionnaire.'}), 403
+        return f(*args, **kwargs)
+    return decorated
+
+def nom_complet(u):
+    return (' '.join(x for x in ((u.first_name or '').strip(), (u.last_name or '').strip()) if x) or u.phone) if u else '—'
+
+def user_list_json(u):
+    return {'id':u.id,'phone':u.phone,'first_name':u.first_name,'last_name':u.last_name,'email':u.email,'role':u.role,'status':u.status,
+            'region':u.region,'commune':u.commune,'profile_type':u.profile_type,'ngd_id':u.ngd_id,
+            'created_at':u.created_at.isoformat() if u.created_at else None,
+            'tete_de_liste':u.role == 'admin','gestionnaire':est_gestionnaire(u),
+            'candidature':u.candidature,'promoted_at':u.promoted_at.isoformat() if u.promoted_at else None}
+
 @users_bp.route('', methods=['GET'])
 @token_required
+@annuaire_required
 def list_users():
-    page = request.args.get('page', 1, type=int)
-    per_page = request.args.get('per_page', 10, type=int)
+    page = max(request.args.get('page', 1, type=int) or 1, 1)
+    per_page = request.args.get('per_page', type=int) or request.args.get('limit', type=int) or 10
+    per_page = min(max(per_page, 1), 200)
     search = request.args.get('search', '').strip()
+    role = request.args.get('role', '').strip().lower()
     q = User.query.order_by(User.created_at.desc())
     if search:
         q = q.filter(db.or_(
             User.first_name.ilike(f'%{search}%'),
             User.last_name.ilike(f'%{search}%'),
-            User.phone.ilike(f'%{search}%')
+            User.phone.ilike(f'%{search}%'),
+            User.candidature.ilike(f'%{search}%')
         ))
+    if role in ('admin', 'user', 'superadmin'):
+        q = q.filter(User.role == role)
     total = q.count()
     users = q.offset((page-1)*per_page).limit(per_page).all()
-    return jsonify({'status':'success','page':page,'per_page':per_page,'total':total,'users':[{'id':u.id,'phone':u.phone,'first_name':u.first_name,'last_name':u.last_name,'email':u.email,'role':u.role,'status':u.status,'region':u.region,'commune':u.commune,'profile_type':u.profile_type,'ngd_id':u.ngd_id,'created_at':u.created_at.isoformat() if u.created_at else None} for u in users]})
+    return jsonify({'status':'success','page':page,'per_page':per_page,'total':total,'users':[user_list_json(u) for u in users]})
+
+def _utilisateur_cible(data):
+    try: uid = int(data.get('user_id') or 0)
+    except (TypeError, ValueError): uid = 0
+    return db.session.get(User, uid) if uid > 0 else None
+
+@users_bp.route('/promote', methods=['POST'])
+@token_required
+@gestionnaire_required
+def promote_user():
+    # v2.11.0 — « Promouvoir Candidat Tête de liste » : rôle admin → accès Boutique
+    data = request.get_json() or {}
+    me = request.current_user
+    u = _utilisateur_cible(data)
+    if not u: return jsonify({'status':'error','message':'Utilisateur introuvable'}), 404
+    if u.role == 'superadmin': return jsonify({'status':'error','message':'Compte superadmin : non modifiable ici.'}), 409
+    if (u.status or 'active') != 'active': return jsonify({'status':'error','message':"Ce compte n'est pas actif."}), 409
+    cand = ' '.join(str(data.get('candidature') or '').split())
+    if not (3 <= len(cand) <= 150):
+        return jsonify({'status':'error','message':'Indiquez la liste et la circonscription du Candidat (3 à 150 caractères).'}), 400
+    if data.get('confirme') is not True:
+        return jsonify({'status':'error','message':'Confirmez que cette personne est Candidat Tête de liste officiel.'}), 400
+    ancien = u.role or 'user'
+    if ancien == 'admin' and (u.candidature or '') == cand:
+        return jsonify({'status':'error','message':f"{nom_complet(u)} est déjà Candidat Tête de liste ({cand})."}), 409
+    u.role = 'admin'; u.candidature = cand
+    if ancien != 'admin': u.promoted_at = datetime.datetime.utcnow(); u.promoted_by = me.id
+    db.session.add(RoleChange(user_id=u.id, old_role=ancien, new_role='admin', candidature=cand,
+                              motif=('Promotion' if ancien != 'admin' else 'Mise à jour de la candidature'), by_user_id=me.id))
+    db.session.commit()
+    msg = (f"{nom_complet(u)} est désormais Candidat Tête de liste — la Boutique lui est ouverte." if ancien != 'admin'
+           else f"Candidature de {nom_complet(u)} mise à jour.")
+    return jsonify({'status':'success','message':msg,'user':user_list_json(u)})
+
+@users_bp.route('/demote', methods=['POST'])
+@token_required
+@gestionnaire_required
+def demote_user():
+    # v2.11.0 — retrait du statut Candidat Tête de liste (retour « Citoyen en formation »), effet immédiat
+    data = request.get_json() or {}
+    me = request.current_user
+    u = _utilisateur_cible(data)
+    if not u: return jsonify({'status':'error','message':'Utilisateur introuvable'}), 404
+    if u.id == me.id: return jsonify({'status':'error','message':'Vous ne pouvez pas retirer votre propre statut.'}), 409
+    if u.role != 'admin': return jsonify({'status':'error','message':f"{nom_complet(u)} n'est pas Candidat Tête de liste."}), 409
+    if est_officiel(u): return jsonify({'status':'error','message':f"{nom_complet(u)} est un compte officiel VoteConnect : son statut ne se retire pas ici."}), 409
+    motif = ' '.join(str(data.get('motif') or '').split())
+    if not (3 <= len(motif) <= 300):
+        return jsonify({'status':'error','message':'Indiquez le motif du retrait (3 à 300 caractères).'}), 400
+    a_verifier = Order.query.filter_by(user_id=u.id, payment_status='declared').count()
+    db.session.add(RoleChange(user_id=u.id, old_role='admin', new_role='user', candidature=u.candidature, motif=motif, by_user_id=me.id))
+    u.role = 'user'; u.candidature = None
+    db.session.commit()
+    msg = f"{nom_complet(u)} redevient Citoyen en formation — la Boutique lui est fermée."
+    if a_verifier: msg += f" {a_verifier} paiement(s) déclaré(s) restent à vérifier dans Boutique → Paiements."
+    if est_gestionnaire(u): msg += " Attention : son numéro figure dans GESTIONNAIRES_BOUTIQUE (Render), il garde donc l'accès Gestionnaire."
+    return jsonify({'status':'success','message':msg,'user':user_list_json(u)})
+
+@users_bp.route('/role-history', methods=['GET'])
+@token_required
+@gestionnaire_required
+def role_history():
+    rows = RoleChange.query.order_by(RoleChange.created_at.desc(), RoleChange.id.desc()).limit(100).all()
+    ids = {r.user_id for r in rows} | {r.by_user_id for r in rows if r.by_user_id}
+    noms = {u.id: nom_complet(u) for u in (User.query.filter(User.id.in_(ids)).all() if ids else [])}
+    return jsonify({'status':'success','history':[{'id':r.id,'user_id':r.user_id,'user':noms.get(r.user_id, f'#{r.user_id}'),
+        'action':'promotion' if r.new_role == 'admin' and r.old_role != 'admin' else ('mise_a_jour' if r.new_role == 'admin' else 'retrait'),
+        'candidature':r.candidature,'motif':r.motif,'par':noms.get(r.by_user_id, '—'),
+        'created_at':r.created_at.isoformat() if r.created_at else None} for r in rows]})
 
 # ============================================================
 # BLUEPRINT : CAMPAIGNS
@@ -511,6 +759,7 @@ def list_orders():
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', 10, type=int)
     q = Order.query.order_by(Order.created_at.desc())
+    if not est_gestionnaire(request.current_user): q = q.filter(Order.user_id == request.current_user.id)   # v2.10.0
     total = q.count()
     orders = q.offset((page-1)*per_page).limit(per_page).all()
     result = []
@@ -525,7 +774,8 @@ def get_order():
     oid = request.args.get('id', type=int)
     if not oid: return jsonify({'status':'error','message':'id requis'}), 400
     o = Order.query.get(oid)
-    if not o: return jsonify({'status':'error','message':'Commande introuvable'}), 404
+    if not o or not (est_gestionnaire(request.current_user) or o.user_id == request.current_user.id):   # v2.10.0
+        return jsonify({'status':'error','message':'Commande introuvable'}), 404
     u = User.query.get(o.user_id)
     items = OrderItem.query.filter_by(order_id=o.id).all()
     items_out = []
@@ -534,108 +784,191 @@ def get_order():
         items_out.append({'id':it.id,'product_id':it.product_id,'product_name':p.name if p else '—','quantity':it.quantity,'unit_price':float(it.unit_price),'total_price':float(it.total_price)})
     return jsonify({'status':'success','order':{'id':o.id,'order_number':o.order_number,'total_amount':float(o.total_amount) if o.total_amount else 0,'status':o.status,'payment_status':o.payment_status,'payment_method':o.payment_method,'region':o.region,'commune':o.commune,'created_at':o.created_at.isoformat() if o.created_at else None,'user':{'id':u.id,'phone':u.phone,'first_name':u.first_name,'last_name':u.last_name} if u else None,'items':items_out}})
 
+PAIEMENT_FERME = {'status':'error','message':"Route fermée (v2.10.0) : payez par Wave puis saisissez la référence de la transaction (POST /api/shop/orders/declare-payment). Le paiement est validé par VoteConnect après contrôle."}
+
 @orders_bp.route('/pay', methods=['POST'])
 @token_required
 def pay_order():
-    data = request.get_json() or {}
-    oid = data.get('id') or data.get('order_id')
-    method = data.get('payment_method','mobile_money')
-    if not oid: return jsonify({'status':'error','message':'id requis'}), 400
-    o = Order.query.get(oid)
-    if not o: return jsonify({'status':'error','message':'Commande introuvable'}), 404
-    o.payment_status = 'paid'; o.payment_method = method; o.status = 'completed'
-    db.session.commit()
-    return jsonify({'status':'success','message':'Paiement enregistre','order':{'id':o.id,'payment_status':o.payment_status}})
+    # v2.10.0 — cette route marquait n'importe quelle commande « payée » sans aucun paiement : fermée.
+    return jsonify(PAIEMENT_FERME), 410
 
 # ============================================================
-# BLUEPRINT : SHOP
+# BLUEPRINT : SHOP — v2.10.0 « Boutique sécurisée »
+# • Boutique réservée aux Candidats Têtes de liste (rôle admin) et au(x)
+#   Gestionnaire(s) VoteConnect.
+# • Paiement : Wave, marchand Formation (WAVE_MARCHAND_FORMATION).
+#   Commande → lien Wave → RÉFÉRENCE Wave obligatoire → validation par le
+#   Gestionnaire après contrôle dans l'application Wave.
+# • Le stock n'est retiré, la facture payée et la livraison lancée qu'à la
+#   validation. Une référence Wave ne sert qu'une fois.
+# • Catalogue, fournisseurs, stocks, livraisons, factures : Gestionnaire seul.
 # ============================================================
 shop_bp = Blueprint('shop', __name__, url_prefix='/api/shop')
 
+STATUTS_LIVRAISON_OK = ('pending', 'processing', 'shipped', 'delivered')
+STATUTS_COMMANDE_APRES_PAIEMENT = ('confirmed', 'processing', 'shipped', 'delivered', 'completed')
+
+def _items_json(order_id):
+    out = []
+    for it in OrderItem.query.filter_by(order_id=order_id).all():
+        p = db.session.get(Product, it.product_id)
+        out.append({'id': it.id, 'product_id': it.product_id, 'product_name': p.name if p else '—', 'quantity': it.quantity,
+                    'unit_price': float(it.unit_price or 0), 'total_price': float(it.total_price or 0)})
+    return out
+
+def _user_court(u):
+    return {'id': u.id, 'phone': u.phone, 'first_name': u.first_name, 'last_name': u.last_name} if u else None
+
+def order_json(o, details=False):
+    u = db.session.get(User, o.user_id)
+    d = {'id': o.id, 'order_number': o.order_number, 'user_id': o.user_id,
+         'total_amount': float(o.total_amount) if o.total_amount else 0, 'status': o.status,
+         'payment_status': o.payment_status, 'payment_method': o.payment_method,
+         'wave_reference': o.wave_reference, 'payment_note': o.payment_note,
+         'payment_declared_at': o.payment_declared_at.isoformat() if o.payment_declared_at else None,
+         'payment_validated_at': o.payment_validated_at.isoformat() if o.payment_validated_at else None,
+         'region': o.region, 'commune': o.commune,
+         'created_at': o.created_at.isoformat() if o.created_at else None,
+         'user': _user_court(u), 'items': _items_json(o.id),
+         'wave_url': lien_wave(o.total_amount) if o.payment_status in ('pending', 'rejected') else None}
+    if details:
+        inv = Invoice.query.filter_by(order_id=o.id).first()
+        d['invoice'] = {'id': inv.id, 'invoice_number': inv.invoice_number, 'amount': float(inv.amount or 0), 'status': inv.status,
+                        'paid_at': inv.paid_at.isoformat() if inv.paid_at else None} if inv else None
+        livs = []
+        for dl in Delivery.query.filter_by(order_id=o.id).all():
+            s = db.session.get(Supplier, dl.supplier_id) if dl.supplier_id else None
+            livs.append({'id': dl.id, 'status': dl.status, 'tracking_number': dl.tracking_number,
+                         'estimated_date': str(dl.estimated_date) if dl.estimated_date else None,
+                         'delivered_at': dl.delivered_at.isoformat() if dl.delivered_at else None,
+                         'supplier': {'id': s.id, 'name': s.name, 'phone': s.phone} if s else None,
+                         'delivery_person': dl.delivery_person, 'delivery_phone': dl.delivery_phone,
+                         'address': dl.address, 'notes': dl.notes})
+        d['deliveries'] = livs
+    return d
+
+def _commande_visible(o):
+    u = request.current_user
+    return o is not None and (est_gestionnaire(u) or o.user_id == u.id)
+
+def _ids_commandes_visibles():
+    """None = toutes (Gestionnaire) ; sinon la liste des commandes de l'utilisateur."""
+    u = request.current_user
+    if est_gestionnaire(u): return None
+    return [o.id for o in Order.query.with_entities(Order.id).filter_by(user_id=u.id).all()]
+
+# ── Catalogue ──────────────────────────────────────────────
+def _product_json(p):
+    return {'id': p.id, 'name': p.name, 'description': p.description, 'category': p.category, 'price': float(p.price or 0),
+            'stock_quantity': p.stock_quantity, 'supplier_id': p.supplier_id, 'status': p.status, 'image_url': p.image_url,
+            'created_at': p.created_at.isoformat() if p.created_at else None}
+
 @shop_bp.route('/products', methods=['GET'])
 @token_required
+@boutique_required
 def shop_list_products():
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', 20, type=int)
     cat = request.args.get('category', '')
     search = request.args.get('search', '').strip()
     q = Product.query
+    if not est_gestionnaire(request.current_user): q = q.filter(Product.status == 'active')
     if cat: q = q.filter_by(category=cat)
     if search: q = q.filter(Product.name.ilike(f'%{search}%'))
     q = q.order_by(Product.created_at.desc())
     total = q.count()
     products = q.offset((page-1)*per_page).limit(per_page).all()
-    return jsonify({'status':'success','page':page,'per_page':per_page,'total':total,'products':[{'id':p.id,'name':p.name,'description':p.description,'category':p.category,'price':float(p.price),'stock_quantity':p.stock_quantity,'supplier_id':p.supplier_id,'status':p.status,'image_url':p.image_url,'created_at':p.created_at.isoformat() if p.created_at else None} for p in products]})
+    return jsonify({'status':'success','page':page,'per_page':per_page,'total':total,'products':[_product_json(p) for p in products]})
 
 @shop_bp.route('/products', methods=['POST'])
 @token_required
-@admin_required
+@gestionnaire_required
 def shop_create_product():
     data = request.get_json() or {}
+    if not str(data.get('name') or '').strip(): return jsonify({'status':'error','message':'Nom du produit requis'}), 400
+    try: prix = float(data.get('price', 0) or 0)
+    except (TypeError, ValueError): return jsonify({'status':'error','message':'Prix invalide'}), 400
+    if prix < 0: return jsonify({'status':'error','message':'Prix invalide'}), 400
     p = Product(name=data.get('name',''), description=data.get('description',''), category=data.get('category','general'),
-                price=data.get('price',0), stock_quantity=data.get('stock_quantity',0), supplier_id=data.get('supplier_id'),
+                price=prix, stock_quantity=int(data.get('stock_quantity', 0) or 0), supplier_id=data.get('supplier_id') or None,
                 status=data.get('status','active'), image_url=data.get('image_url',''))
     db.session.add(p); db.session.commit()
     return jsonify({'status':'success','product':{'id':p.id,'name':p.name}}), 201
 
 @shop_bp.route('/products/detail', methods=['GET'])
 @token_required
+@boutique_required
 def shop_get_product():
     pid = request.args.get('id', type=int)
     if not pid: return jsonify({'status':'error','message':'id requis'}), 400
-    p = Product.query.get(pid)
+    p = db.session.get(Product, pid)
     if not p: return jsonify({'status':'error','message':'Produit introuvable'}), 404
-    return jsonify({'status':'success','product':{'id':p.id,'name':p.name,'description':p.description,'category':p.category,'price':float(p.price),'stock_quantity':p.stock_quantity,'supplier_id':p.supplier_id,'status':p.status,'image_url':p.image_url}})
+    return jsonify({'status':'success','product':_product_json(p)})
 
 @shop_bp.route('/products/update', methods=['POST'])
 @token_required
-@admin_required
+@gestionnaire_required
 def shop_update_product():
     data = request.get_json() or {}
     pid = data.get('id')
     if not pid: return jsonify({'status':'error','message':'id requis'}), 400
-    p = Product.query.get(pid)
+    p = db.session.get(Product, int(pid))
     if not p: return jsonify({'status':'error','message':'Produit introuvable'}), 404
     p.name = data.get('name', p.name); p.description = data.get('description', p.description)
     p.category = data.get('category', p.category); p.price = data.get('price', p.price)
-    p.stock_quantity = data.get('stock_quantity', p.stock_quantity); p.supplier_id = data.get('supplier_id', p.supplier_id)
+    p.stock_quantity = data.get('stock_quantity', p.stock_quantity); p.supplier_id = data.get('supplier_id', p.supplier_id) or None
     p.status = data.get('status', p.status); p.image_url = data.get('image_url', p.image_url)
     db.session.commit()
     return jsonify({'status':'success','product':{'id':p.id,'name':p.name}})
 
 @shop_bp.route('/products/delete', methods=['POST'])
 @token_required
-@admin_required
+@gestionnaire_required
 def shop_delete_product():
     data = request.get_json() or {}
     pid = data.get('id')
     if not pid: return jsonify({'status':'error','message':'id requis'}), 400
-    p = Product.query.get(pid)
+    p = db.session.get(Product, int(pid))
     if not p: return jsonify({'status':'error','message':'Produit introuvable'}), 404
+    if OrderItem.query.filter_by(product_id=p.id).first():
+        p.status = 'inactive'; db.session.commit()   # déjà vendu : on le retire du catalogue sans casser l'historique
+        return jsonify({'status':'success','message':'Produit retiré du catalogue (déjà présent dans des commandes)'})
+    CartItem.query.filter_by(product_id=p.id).delete()
     db.session.delete(p); db.session.commit()
     return jsonify({'status':'success','message':'Produit supprimé'})
 
+# ── Panier ─────────────────────────────────────────────────
 @shop_bp.route('/cart', methods=['GET'])
 @token_required
+@boutique_required
 def shop_get_cart():
     user_id = request.current_user.id
     items = CartItem.query.filter_by(user_id=user_id).all()
     result = []; total = 0
     for it in items:
-        p = Product.query.get(it.product_id)
+        p = db.session.get(Product, it.product_id)
         if p:
-            sub = float(p.price) * it.quantity; total += sub
-            result.append({'id':it.id,'product_id':p.id,'name':p.name,'price':float(p.price),'quantity':it.quantity,'subtotal':sub,'image_url':p.image_url})
-    return jsonify({'status':'success','items':result,'total':total,'count':len(result)})
+            sub = float(p.price or 0) * it.quantity; total += sub
+            result.append({'id':it.id,'product_id':p.id,'name':p.name,'price':float(p.price or 0),'quantity':it.quantity,'subtotal':sub,'image_url':p.image_url})
+    return jsonify({'status':'success','items':result,'total':total,'count':len(result),'wave_marchand':'Formation'})
 
 @shop_bp.route('/cart/add', methods=['POST'])
 @token_required
+@boutique_required
 def shop_add_cart():
     data = request.get_json() or {}
     user_id = request.current_user.id
-    product_id = data.get('product_id'); qty = data.get('quantity', 1)
-    if not product_id: return jsonify({'status':'error','message':'product_id requis'}), 400
+    try:
+        product_id = int(data.get('product_id') or 0); qty = int(data.get('quantity', 1) or 1)
+    except (TypeError, ValueError):
+        return jsonify({'status':'error','message':'Produit ou quantité invalide'}), 400
+    if not product_id or qty < 1 or qty > 999: return jsonify({'status':'error','message':'Produit ou quantité invalide'}), 400
+    p = db.session.get(Product, product_id)
+    if not p or p.status != 'active': return jsonify({'status':'error','message':'Produit indisponible'}), 404
     existing = CartItem.query.filter_by(user_id=user_id, product_id=product_id).first()
+    deja = existing.quantity if existing else 0
+    if (p.stock_quantity or 0) < deja + qty:
+        return jsonify({'status':'error','message':f'Stock insuffisant pour « {p.name} » ({p.stock_quantity or 0} disponible(s))'}), 409
     if existing: existing.quantity += qty
     else: db.session.add(CartItem(user_id=user_id, product_id=product_id, quantity=qty))
     db.session.commit()
@@ -643,218 +976,226 @@ def shop_add_cart():
 
 @shop_bp.route('/cart/remove', methods=['POST'])
 @token_required
+@boutique_required
 def shop_remove_cart():
     data = request.get_json() or {}
     cid = data.get('id')
     if not cid: return jsonify({'status':'error','message':'id requis'}), 400
-    item = CartItem.query.get(cid)
+    item = db.session.get(CartItem, int(cid))
     if item and item.user_id == request.current_user.id:
         db.session.delete(item); db.session.commit()
     return jsonify({'status':'success','message':'Retiré du panier'})
 
 @shop_bp.route('/cart/clear', methods=['POST'])
 @token_required
+@boutique_required
 def shop_clear_cart():
     CartItem.query.filter_by(user_id=request.current_user.id).delete()
     db.session.commit()
     return jsonify({'status':'success','message':'Panier vidé'})
 
+# ── Commandes ──────────────────────────────────────────────
 @shop_bp.route('/orders', methods=['GET'])
 @token_required
+@boutique_required
 def shop_list_orders():
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', request.args.get('limit', 10, type=int), type=int)
-    q = Order.query.order_by(Order.created_at.desc())
+    q = Order.query
+    if not est_gestionnaire(request.current_user): q = q.filter(Order.user_id == request.current_user.id)
+    statut = request.args.get('payment_status', '').strip()
+    if statut: q = q.filter(Order.payment_status == statut)
+    q = q.order_by(Order.created_at.desc())
     total = q.count()
     orders = q.offset((page-1)*per_page).limit(per_page).all()
-    result = []
-    for o in orders:
-        u = User.query.get(o.user_id)
-        items = OrderItem.query.filter_by(order_id=o.id).all()
-        items_out = []
-        for it in items:
-            p = Product.query.get(it.product_id)
-            items_out.append({'id':it.id,'product_name':p.name if p else '—','quantity':it.quantity,'unit_price':float(it.unit_price),'total_price':float(it.total_price)})
-        result.append({'id':o.id,'order_number':o.order_number,'total_amount':float(o.total_amount) if o.total_amount else 0,'status':o.status,'payment_status':o.payment_status,'payment_method':o.payment_method,'region':o.region,'commune':o.commune,'created_at':o.created_at.isoformat() if o.created_at else None,'user':{'id':u.id,'phone':u.phone,'first_name':u.first_name,'last_name':u.last_name} if u else None,'items':items_out})
-    return jsonify({'status':'success','page':page,'per_page':per_page,'total':total,'orders':result})
+    a_verifier = Order.query.filter_by(payment_status='declared').count() if est_gestionnaire(request.current_user) else None
+    return jsonify({'status':'success','page':page,'per_page':per_page,'total':total,'a_verifier':a_verifier,'orders':[order_json(o) for o in orders]})
 
 @shop_bp.route('/orders/create', methods=['POST'])
 @token_required
+@boutique_required
 def shop_create_order():
-    user_id = request.current_user.id
+    user = request.current_user
     data = request.get_json() or {}
-    cart_items = CartItem.query.filter_by(user_id=user_id).all()
+    cart_items = CartItem.query.filter_by(user_id=user.id).all()
     if not cart_items: return jsonify({'status':'error','message':'Panier vide'}), 400
-    total = 0
-    order = Order(order_number=generate_order_number(), user_id=user_id, total_amount=0,
-                  status='pending', payment_status='pending', region=data.get('region',''), commune=data.get('commune',''))
-    db.session.add(order); db.session.commit()
-
-    # Suivi des fournisseurs concernés pour livraison auto
-    suppliers_map = {}  # supplier_id -> {'items': [], 'subtotal': 0}
-
+    lignes = []
     for ci in cart_items:
-        p = Product.query.get(ci.product_id)
-        if not p: continue
-        sub = float(p.price) * ci.quantity; total += sub
-        db.session.add(OrderItem(order_id=order.id, product_id=p.id, quantity=ci.quantity, unit_price=p.price, total_price=sub))
-        p.stock_quantity = max(0, (p.stock_quantity or 0) - ci.quantity)
-        db.session.add(StockMovement(product_id=p.id, movement_type='out', quantity=ci.quantity, reason=f'Commande {order.order_number}'))
-
-        # Sélection auto fournisseur par produit
-        if p.supplier_id:
-            if p.supplier_id not in suppliers_map:
-                suppliers_map[p.supplier_id] = {'items': [], 'subtotal': 0}
-            suppliers_map[p.supplier_id]['items'].append(p.name)
-            suppliers_map[p.supplier_id]['subtotal'] += sub
-
-    order.total_amount = total
-
-    # === AUTO-FACTURE ===
-    invoice = Invoice(
-        order_id=order.id,
-        invoice_number=generate_invoice_number(),
-        amount=total,
-        status='pending',
-        due_date=datetime.date.today() + datetime.timedelta(days=7)
-    )
+        p = db.session.get(Product, ci.product_id)
+        if not p or p.status != 'active':
+            return jsonify({'status':'error','message':'Un produit du panier n\'est plus disponible : retirez-le puis recommencez.'}), 409
+        if (p.stock_quantity or 0) < ci.quantity:
+            return jsonify({'status':'error','message':f'Stock insuffisant pour « {p.name} » ({p.stock_quantity or 0} disponible(s))'}), 409
+        lignes.append((p, ci.quantity))
+    total = sum(float(p.price or 0) * q for p, q in lignes)
+    if total <= 0: return jsonify({'status':'error','message':'Montant de la commande invalide'}), 400
+    order = Order(order_number=generate_order_number(), user_id=user.id, total_amount=total,
+                  status='pending', payment_status='pending', payment_method='wave_formation',
+                  region=data.get('region') or user.region or '', commune=data.get('commune') or user.commune or '')
+    db.session.add(order); db.session.flush()
+    fournisseurs = {}
+    for p, q in lignes:
+        sub = float(p.price or 0) * q
+        db.session.add(OrderItem(order_id=order.id, product_id=p.id, quantity=q, unit_price=p.price, total_price=sub))
+        if p.supplier_id: fournisseurs.setdefault(p.supplier_id, []).append(p.name)
+    invoice = Invoice(order_id=order.id, invoice_number=generate_invoice_number(), amount=total, status='pending',
+                      due_date=datetime.date.today() + datetime.timedelta(days=7))
     db.session.add(invoice)
-
-    # === AUTO-LIVRAISON + SÉLECTION AUTO FOURNISSEUR & LIVREUR ===
-    deliveries_created = []
-    if suppliers_map:
-        for sid, info in suppliers_map.items():
-            supplier = Supplier.query.get(sid)
-            if supplier:
-                # Livreur = contact du fournisseur (sélection auto)
-                delivery = Delivery(
-                    order_id=order.id,
-                    supplier_id=supplier.id,
-                    status='pending',
-                    address=supplier.address or data.get('address',''),
-                    region=supplier.region or data.get('region',''),
-                    commune=supplier.commune or data.get('commune',''),
-                    estimated_date=datetime.date.today() + datetime.timedelta(days=3),
-                    delivery_person=supplier.contact_name or 'Livreur assigné',
-                    delivery_phone=supplier.phone or '',
-                    notes=f"Livraison auto — {len(info['items'])} article(s): {', '.join(info['items'][:3])}{'...' if len(info['items']) > 3 else ''}"
-                )
-                db.session.add(delivery)
-                deliveries_created.append({
-                    'id': delivery.id,
-                    'supplier_name': supplier.name,
-                    'delivery_person': delivery.delivery_person,
-                    'delivery_phone': delivery.delivery_phone,
-                    'estimated_date': str(delivery.estimated_date),
-                    'status': delivery.status
-                })
+    # Livraisons préparées, mais lancées seulement après validation du paiement
+    if fournisseurs:
+        for sid, noms in fournisseurs.items():
+            s = db.session.get(Supplier, sid)
+            if not s: continue
+            db.session.add(Delivery(order_id=order.id, supplier_id=s.id, status='awaiting_payment',
+                                    address=s.address or data.get('address',''), region=s.region or order.region, commune=s.commune or order.commune,
+                                    delivery_person=s.contact_name or 'Livreur assigné', delivery_phone=s.phone or '',
+                                    notes=f"{len(noms)} article(s) : {', '.join(noms[:3])}{'…' if len(noms) > 3 else ''} — départ après validation du paiement"))
     else:
-        # Aucun fournisseur identifié — livraison générique
-        delivery = Delivery(
-            order_id=order.id,
-            status='pending',
-            region=data.get('region',''),
-            commune=data.get('commune',''),
-            estimated_date=datetime.date.today() + datetime.timedelta(days=3),
-            delivery_person="Livreur en attente d'assignation",
-            notes='Livraison générique — fournisseur non identifié'
-        )
-        db.session.add(delivery)
-        deliveries_created.append({
-            'id': delivery.id,
-            'supplier_name': None,
-            'delivery_person': delivery.delivery_person,
-            'delivery_phone': '',
-            'estimated_date': str(delivery.estimated_date),
-            'status': delivery.status
-        })
-
-    CartItem.query.filter_by(user_id=user_id).delete()
+        db.session.add(Delivery(order_id=order.id, status='awaiting_payment', region=order.region, commune=order.commune,
+                                delivery_person="Livreur en attente d'assignation", notes='Départ après validation du paiement'))
+    CartItem.query.filter_by(user_id=user.id).delete()
     db.session.commit()
-
-    return jsonify({
-        'status':'success',
-        'order':{'id':order.id,'order_number':order.order_number,'total_amount':float(total)},
-        'invoice':{'invoice_number':invoice.invoice_number,'amount':float(invoice.amount),'status':invoice.status,'due_date':str(invoice.due_date)},
-        'deliveries':deliveries_created
-    }), 201
+    return jsonify({'status':'success',
+                    'order':{'id':order.id,'order_number':order.order_number,'total_amount':float(total),'payment_status':order.payment_status},
+                    'invoice':{'invoice_number':invoice.invoice_number,'amount':float(total),'status':invoice.status,'due_date':str(invoice.due_date)},
+                    'wave_url': lien_wave(total), 'wave_marchand':'Formation',
+                    'instructions':'Payez avec Wave, puis saisissez la référence de la transaction Wave : votre commande sera confirmée après vérification par VoteConnect.'}), 201
 
 @shop_bp.route('/orders/detail', methods=['GET'])
 @token_required
+@boutique_required
 def shop_get_order():
     oid = request.args.get('id', type=int)
     if not oid: return jsonify({'status':'error','message':'id requis'}), 400
-    o = Order.query.get(oid)
+    o = db.session.get(Order, oid)
+    if not _commande_visible(o): return jsonify({'status':'error','message':'Commande introuvable'}), 404
+    return jsonify({'status':'success','order':order_json(o, details=True)})
+
+@shop_bp.route('/orders/declare-payment', methods=['POST'])
+@token_required
+@boutique_required
+def shop_declare_payment():
+    data = request.get_json() or {}
+    o = db.session.get(Order, int(data.get('id') or 0)) if str(data.get('id') or '').isdigit() else None
+    if not o or o.user_id != request.current_user.id:
+        return jsonify({'status':'error','message':'Commande introuvable'}), 404
+    if o.payment_status not in ('pending', 'rejected'):
+        msg = {'declared':'Paiement déjà déclaré : vérification en cours.','paid':'Commande déjà payée.','cancelled':'Commande annulée.'}.get(o.payment_status, 'Paiement non modifiable.')
+        return jsonify({'status':'error','message':msg}), 409
+    ref = norm_ref_wave(data.get('reference'))
+    if not re.fullmatch(r'[A-Z0-9]{6,30}', ref):
+        return jsonify({'status':'error','message':'Référence Wave invalide : 6 à 30 lettres ou chiffres, telle qu\'elle figure sur votre reçu Wave.'}), 400
+    deja = Order.query.filter(Order.wave_reference == ref, Order.id != o.id, Order.payment_status.in_(('declared', 'paid'))).first()
+    if deja: return jsonify({'status':'error','message':'Cette référence Wave a déjà été utilisée pour une autre commande.'}), 409
+    o.wave_reference = ref; o.payment_status = 'declared'; o.payment_method = 'wave_formation'
+    o.payment_declared_at = datetime.datetime.utcnow(); o.payment_note = None
+    db.session.commit()
+    return jsonify({'status':'success','message':'Référence reçue : paiement en cours de vérification par VoteConnect.','order':order_json(o)})
+
+@shop_bp.route('/orders/validate-payment', methods=['POST'])
+@token_required
+@gestionnaire_required
+def shop_validate_payment():
+    data = request.get_json() or {}
+    o = db.session.get(Order, int(data.get('id') or 0)) if str(data.get('id') or '').isdigit() else None
     if not o: return jsonify({'status':'error','message':'Commande introuvable'}), 404
-    u = User.query.get(o.user_id)
+    if o.payment_status != 'declared':
+        return jsonify({'status':'error','message':'Seul un paiement déclaré (référence saisie) peut être validé ou rejeté.'}), 409
+    decision = str(data.get('decision') or '').lower()
+    maintenant = datetime.datetime.utcnow()
+    if decision == 'rejeter':
+        motif = str(data.get('motif') or '').strip()[:200] or 'Paiement introuvable dans Wave'
+        o.payment_note = f"Référence {o.wave_reference} rejetée : {motif}"
+        o.payment_status = 'rejected'; o.wave_reference = None
+        o.payment_validated_at = maintenant; o.payment_validated_by = request.current_user.id
+        db.session.commit()
+        return jsonify({'status':'success','message':'Paiement rejeté : le client peut saisir une nouvelle référence.','order':order_json(o)})
+    if decision != 'valider': return jsonify({'status':'error','message':'decision = valider ou rejeter'}), 400
     items = OrderItem.query.filter_by(order_id=o.id).all()
-    items_out = []
+    for it in items:   # le stock a pu bouger depuis la commande
+        p = db.session.get(Product, it.product_id)
+        if p and (p.stock_quantity or 0) < it.quantity:
+            return jsonify({'status':'error','message':f'Stock insuffisant pour « {p.name} » : réapprovisionnez avant de valider.'}), 409
     for it in items:
-        p = Product.query.get(it.product_id)
-        items_out.append({'id':it.id,'product_name':p.name if p else '—','quantity':it.quantity,'unit_price':float(it.unit_price),'total_price':float(it.total_price)})
+        p = db.session.get(Product, it.product_id)
+        if p:
+            p.stock_quantity = (p.stock_quantity or 0) - it.quantity
+            db.session.add(StockMovement(product_id=p.id, movement_type='out', quantity=it.quantity, reason=f'Commande {o.order_number} (payée)'))
+    o.payment_status = 'paid'; o.status = 'confirmed'
+    o.payment_validated_at = maintenant; o.payment_validated_by = request.current_user.id
     inv = Invoice.query.filter_by(order_id=o.id).first()
-    deliveries = Delivery.query.filter_by(order_id=o.id).all()
-    deliveries_out = []
-    for d in deliveries:
-        s = Supplier.query.get(d.supplier_id) if d.supplier_id else None
-        deliveries_out.append({
-            'id':d.id,
-            'status':d.status,
-            'tracking_number':d.tracking_number,
-            'estimated_date':str(d.estimated_date) if d.estimated_date else None,
-            'delivered_at':d.delivered_at.isoformat() if d.delivered_at else None,
-            'supplier':{'id':s.id,'name':s.name,'phone':s.phone} if s else None,
-            'delivery_person':d.delivery_person,
-            'delivery_phone':d.delivery_phone,
-            'address':d.address,
-            'notes':d.notes
-        })
-    return jsonify({'status':'success','order':{'id':o.id,'order_number':o.order_number,'total_amount':float(o.total_amount) if o.total_amount else 0,'status':o.status,'payment_status':o.payment_status,'payment_method':o.payment_method,'region':o.region,'commune':o.commune,'created_at':o.created_at.isoformat() if o.created_at else None,'user':{'id':u.id,'phone':u.phone,'first_name':u.first_name,'last_name':u.last_name} if u else None,'items':items_out,'invoice':{'id':inv.id,'invoice_number':inv.invoice_number,'amount':float(inv.amount),'status':inv.status} if inv else None,'deliveries':deliveries_out}})
+    if inv: inv.status = 'paid'; inv.paid_at = maintenant
+    for dl in Delivery.query.filter_by(order_id=o.id).all():
+        if dl.status == 'awaiting_payment': dl.status = 'pending'
+    db.session.commit()
+    return jsonify({'status':'success','message':'Paiement validé : commande confirmée, facture payée, livraison lancée.','order':order_json(o)})
+
+@shop_bp.route('/orders/cancel', methods=['POST'])
+@token_required
+@boutique_required
+def shop_cancel_order():
+    data = request.get_json() or {}
+    o = db.session.get(Order, int(data.get('id') or 0)) if str(data.get('id') or '').isdigit() else None
+    if not _commande_visible(o): return jsonify({'status':'error','message':'Commande introuvable'}), 404
+    if o.payment_status not in ('pending', 'rejected'):
+        return jsonify({'status':'error','message':'Seule une commande non payée et sans paiement en cours de vérification peut être annulée.'}), 409
+    o.status = 'cancelled'; o.payment_status = 'cancelled'
+    inv = Invoice.query.filter_by(order_id=o.id).first()
+    if inv: inv.status = 'cancelled'
+    for dl in Delivery.query.filter_by(order_id=o.id).all(): dl.status = 'cancelled'
+    db.session.commit()
+    return jsonify({'status':'success','message':'Commande annulée','order':order_json(o)})
 
 @shop_bp.route('/orders/update', methods=['POST'])
 @token_required
-@admin_required
+@gestionnaire_required
 def shop_update_order():
     data = request.get_json() or {}
-    oid = data.get('id')
-    if not oid: return jsonify({'status':'error','message':'id requis'}), 400
-    o = Order.query.get(oid)
+    o = db.session.get(Order, int(data.get('id') or 0)) if str(data.get('id') or '').isdigit() else None
     if not o: return jsonify({'status':'error','message':'Commande introuvable'}), 404
-    o.status = data.get('status', o.status); o.payment_status = data.get('payment_status', o.payment_status)
-    o.payment_method = data.get('payment_method', o.payment_method)
+    statut = data.get('status')
+    if statut:
+        if o.payment_status != 'paid' or statut not in STATUTS_COMMANDE_APRES_PAIEMENT:
+            return jsonify({'status':'error','message':'Le suivi (traitement, expédition, livraison) ne s\'applique qu\'à une commande payée. Le paiement se valide uniquement par « Valider le paiement ».'}), 409
+        o.status = statut
     db.session.commit()
     return jsonify({'status':'success','order':{'id':o.id,'status':o.status}})
 
 @shop_bp.route('/orders/delete', methods=['POST'])
 @token_required
-@admin_required
+@gestionnaire_required
 def shop_delete_order():
     data = request.get_json() or {}
-    oid = data.get('id')
-    if not oid: return jsonify({'status':'error','message':'id requis'}), 400
-    o = Order.query.get(oid)
+    o = db.session.get(Order, int(data.get('id') or 0)) if str(data.get('id') or '').isdigit() else None
     if not o: return jsonify({'status':'error','message':'Commande introuvable'}), 404
+    if o.payment_status in ('paid', 'declared'):
+        return jsonify({'status':'error','message':'Une commande payée ou en cours de vérification ne se supprime pas (trace comptable).'}), 409
     OrderItem.query.filter_by(order_id=o.id).delete()
     Delivery.query.filter_by(order_id=o.id).delete()
     Invoice.query.filter_by(order_id=o.id).delete()
     db.session.delete(o); db.session.commit()
     return jsonify({'status':'success','message':'Commande supprimée'})
 
+# ── Fournisseurs (Gestionnaire) ────────────────────────────
+def _supplier_json(s):
+    return {'id':s.id,'name':s.name,'contact_name':s.contact_name,'phone':s.phone,'email':s.email,'region':s.region,'commune':s.commune,'address':s.address,'status':s.status,'created_at':s.created_at.isoformat() if s.created_at else None}
+
 @shop_bp.route('/suppliers', methods=['GET'])
 @token_required
+@gestionnaire_required
 def shop_list_suppliers():
     page = request.args.get('page', 1, type=int)
-    per_page = request.args.get('per_page', 10, type=int)
+    per_page = request.args.get('per_page', request.args.get('limit', 10, type=int), type=int)
     q = Supplier.query.order_by(Supplier.created_at.desc())
     total = q.count()
-    suppliers = q.offset((page-1)*per_page).limit(per_page).all()
-    return jsonify({'status':'success','page':page,'per_page':per_page,'total':total,'suppliers':[{'id':s.id,'name':s.name,'contact_name':s.contact_name,'phone':s.phone,'email':s.email,'region':s.region,'commune':s.commune,'address':s.address,'status':s.status,'created_at':s.created_at.isoformat() if s.created_at else None} for s in suppliers]})
+    return jsonify({'status':'success','page':page,'per_page':per_page,'total':total,'suppliers':[_supplier_json(s) for s in q.offset((page-1)*per_page).limit(per_page).all()]})
 
 @shop_bp.route('/suppliers', methods=['POST'])
 @token_required
-@admin_required
+@gestionnaire_required
 def shop_create_supplier():
     data = request.get_json() or {}
+    if not str(data.get('name') or '').strip(): return jsonify({'status':'error','message':'Nom du fournisseur requis'}), 400
     s = Supplier(name=data.get('name',''), contact_name=data.get('contact_name',''), phone=data.get('phone',''),
                  email=data.get('email',''), region=data.get('region',''), commune=data.get('commune',''),
                  address=data.get('address',''), status=data.get('status','active'))
@@ -863,62 +1204,65 @@ def shop_create_supplier():
 
 @shop_bp.route('/suppliers/detail', methods=['GET'])
 @token_required
+@gestionnaire_required
 def shop_get_supplier():
     sid = request.args.get('id', type=int)
-    if not sid: return jsonify({'status':'error','message':'id requis'}), 400
-    s = Supplier.query.get(sid)
+    s = db.session.get(Supplier, sid) if sid else None
     if not s: return jsonify({'status':'error','message':'Fournisseur introuvable'}), 404
-    return jsonify({'status':'success','supplier':{'id':s.id,'name':s.name,'contact_name':s.contact_name,'phone':s.phone,'email':s.email,'region':s.region,'commune':s.commune,'address':s.address,'status':s.status}})
+    return jsonify({'status':'success','supplier':_supplier_json(s)})
 
 @shop_bp.route('/suppliers/update', methods=['POST'])
 @token_required
-@admin_required
+@gestionnaire_required
 def shop_update_supplier():
     data = request.get_json() or {}
-    sid = data.get('id')
-    if not sid: return jsonify({'status':'error','message':'id requis'}), 400
-    s = Supplier.query.get(sid)
+    s = db.session.get(Supplier, int(data.get('id') or 0)) if str(data.get('id') or '').isdigit() else None
     if not s: return jsonify({'status':'error','message':'Fournisseur introuvable'}), 404
-    s.name = data.get('name', s.name); s.contact_name = data.get('contact_name', s.contact_name)
-    s.phone = data.get('phone', s.phone); s.email = data.get('email', s.email)
-    s.region = data.get('region', s.region); s.commune = data.get('commune', s.commune)
-    s.address = data.get('address', s.address); s.status = data.get('status', s.status)
+    for k in ('name','contact_name','phone','email','region','commune','address','status'):
+        if k in data: setattr(s, k, data.get(k))
     db.session.commit()
     return jsonify({'status':'success','supplier':{'id':s.id,'name':s.name}})
 
 @shop_bp.route('/suppliers/delete', methods=['POST'])
 @token_required
-@admin_required
+@gestionnaire_required
 def shop_delete_supplier():
     data = request.get_json() or {}
-    sid = data.get('id')
-    if not sid: return jsonify({'status':'error','message':'id requis'}), 400
-    s = Supplier.query.get(sid)
+    s = db.session.get(Supplier, int(data.get('id') or 0)) if str(data.get('id') or '').isdigit() else None
     if not s: return jsonify({'status':'error','message':'Fournisseur introuvable'}), 404
+    if Product.query.filter_by(supplier_id=s.id).first() or Delivery.query.filter_by(supplier_id=s.id).first():
+        s.status = 'inactive'; db.session.commit()
+        return jsonify({'status':'success','message':'Fournisseur désactivé (lié à des produits ou livraisons)'})
     db.session.delete(s); db.session.commit()
     return jsonify({'status':'success','message':'Fournisseur supprimé'})
 
+# ── Livraisons ─────────────────────────────────────────────
+def _delivery_json(d):
+    o = db.session.get(Order, d.order_id)
+    s = db.session.get(Supplier, d.supplier_id) if d.supplier_id else None
+    return {'id':d.id,'order_id':d.order_id,'order_number':o.order_number if o else '—','status':d.status,'tracking_number':d.tracking_number,'address':d.address,'region':d.region,'commune':d.commune,'estimated_date':str(d.estimated_date) if d.estimated_date else None,'delivered_at':d.delivered_at.isoformat() if d.delivered_at else None,'delivery_person':d.delivery_person,'delivery_phone':d.delivery_phone,'supplier_name':s.name if s else '—','notes':d.notes,'created_at':d.created_at.isoformat() if d.created_at else None}
+
 @shop_bp.route('/deliveries', methods=['GET'])
 @token_required
+@boutique_required
 def shop_list_deliveries():
     page = request.args.get('page', 1, type=int)
-    per_page = request.args.get('per_page', 10, type=int)
-    q = Delivery.query.order_by(Delivery.created_at.desc())
+    per_page = request.args.get('per_page', request.args.get('limit', 10, type=int), type=int)
+    q = Delivery.query
+    ids = _ids_commandes_visibles()
+    if ids is not None: q = q.filter(Delivery.order_id.in_(ids or [0]))
+    q = q.order_by(Delivery.created_at.desc())
     total = q.count()
-    deliveries = q.offset((page-1)*per_page).limit(per_page).all()
-    result = []
-    for d in deliveries:
-        o = Order.query.get(d.order_id)
-        s = Supplier.query.get(d.supplier_id) if d.supplier_id else None
-        result.append({'id':d.id,'order_id':d.order_id,'order_number':o.order_number if o else '—','status':d.status,'tracking_number':d.tracking_number,'address':d.address,'region':d.region,'commune':d.commune,'estimated_date':str(d.estimated_date) if d.estimated_date else None,'delivered_at':d.delivered_at.isoformat() if d.delivered_at else None,'delivery_person':d.delivery_person,'delivery_phone':d.delivery_phone,'supplier_name':s.name if s else '—','notes':d.notes,'created_at':d.created_at.isoformat() if d.created_at else None})
-    return jsonify({'status':'success','page':page,'per_page':per_page,'total':total,'deliveries':result})
+    return jsonify({'status':'success','page':page,'per_page':per_page,'total':total,'deliveries':[_delivery_json(d) for d in q.offset((page-1)*per_page).limit(per_page).all()]})
 
 @shop_bp.route('/deliveries', methods=['POST'])
 @token_required
-@admin_required
+@gestionnaire_required
 def shop_create_delivery():
     data = request.get_json() or {}
-    d = Delivery(order_id=data.get('order_id'), status=data.get('status','pending'), tracking_number=data.get('tracking_number',''),
+    o = db.session.get(Order, int(data.get('order_id') or 0)) if str(data.get('order_id') or '').isdigit() else None
+    if not o: return jsonify({'status':'error','message':'Commande introuvable'}), 404
+    d = Delivery(order_id=o.id, status='pending' if o.payment_status == 'paid' else 'awaiting_payment', tracking_number=data.get('tracking_number',''),
                  address=data.get('address',''), region=data.get('region',''), commune=data.get('commune',''),
                  estimated_date=datetime.datetime.strptime(data['estimated_date'],'%Y-%m-%d').date() if data.get('estimated_date') else None,
                  notes=data.get('notes',''))
@@ -927,108 +1271,112 @@ def shop_create_delivery():
 
 @shop_bp.route('/deliveries/detail', methods=['GET'])
 @token_required
+@boutique_required
 def shop_get_delivery():
     did = request.args.get('id', type=int)
-    if not did: return jsonify({'status':'error','message':'id requis'}), 400
-    d = Delivery.query.get(did)
-    if not d: return jsonify({'status':'error','message':'Livraison introuvable'}), 404
-    return jsonify({'status':'success','delivery':{'id':d.id,'order_id':d.order_id,'status':d.status,'tracking_number':d.tracking_number,'address':d.address,'region':d.region,'commune':d.commune,'estimated_date':str(d.estimated_date) if d.estimated_date else None,'delivered_at':d.delivered_at.isoformat() if d.delivered_at else None,'notes':d.notes}})
+    d = db.session.get(Delivery, did) if did else None
+    if not d or not _commande_visible(db.session.get(Order, d.order_id)): return jsonify({'status':'error','message':'Livraison introuvable'}), 404
+    return jsonify({'status':'success','delivery':_delivery_json(d)})
 
 @shop_bp.route('/deliveries/update', methods=['POST'])
 @token_required
-@admin_required
+@gestionnaire_required
 def shop_update_delivery():
     data = request.get_json() or {}
-    did = data.get('id')
-    if not did: return jsonify({'status':'error','message':'id requis'}), 400
-    d = Delivery.query.get(did)
+    d = db.session.get(Delivery, int(data.get('id') or 0)) if str(data.get('id') or '').isdigit() else None
     if not d: return jsonify({'status':'error','message':'Livraison introuvable'}), 404
-    d.status = data.get('status', d.status); d.tracking_number = data.get('tracking_number', d.tracking_number)
-    d.address = data.get('address', d.address); d.region = data.get('region', d.region)
-    d.commune = data.get('commune', d.commune); d.notes = data.get('notes', d.notes)
-    d.delivery_person = data.get('delivery_person', d.delivery_person)
-    d.delivery_phone = data.get('delivery_phone', d.delivery_phone)
+    o = db.session.get(Order, d.order_id)
+    nouveau = data.get('status')
+    if nouveau and nouveau != d.status:
+        if not o or o.payment_status != 'paid':
+            return jsonify({'status':'error','message':'La livraison ne peut démarrer qu\'après la validation du paiement.'}), 409
+        if nouveau not in STATUTS_LIVRAISON_OK: return jsonify({'status':'error','message':'Statut de livraison invalide'}), 400
+        d.status = nouveau
+        if nouveau == 'delivered' and not d.delivered_at: d.delivered_at = datetime.datetime.utcnow()
+    for k in ('tracking_number','address','region','commune','notes','delivery_person','delivery_phone'):
+        if k in data: setattr(d, k, data.get(k))
     if data.get('supplier_id'): d.supplier_id = data.get('supplier_id')
     if data.get('estimated_date'): d.estimated_date = datetime.datetime.strptime(data['estimated_date'],'%Y-%m-%d').date()
     if data.get('delivered_at'): d.delivered_at = datetime.datetime.strptime(data['delivered_at'],'%Y-%m-%dT%H:%M:%S')
     db.session.commit()
     return jsonify({'status':'success','delivery':{'id':d.id,'status':d.status}})
 
+# ── Factures ───────────────────────────────────────────────
+def _invoice_json(inv):
+    o = db.session.get(Order, inv.order_id)
+    return {'id':inv.id,'order_id':inv.order_id,'order_number':o.order_number if o else '—','invoice_number':inv.invoice_number,'amount':float(inv.amount or 0),'status':inv.status,'issued_at':inv.issued_at.isoformat() if inv.issued_at else None,'paid_at':inv.paid_at.isoformat() if inv.paid_at else None,'due_date':str(inv.due_date) if inv.due_date else None}
+
 @shop_bp.route('/invoices', methods=['GET'])
 @token_required
+@boutique_required
 def shop_list_invoices():
     page = request.args.get('page', 1, type=int)
-    per_page = request.args.get('per_page', 10, type=int)
-    q = Invoice.query.order_by(Invoice.issued_at.desc())
+    per_page = request.args.get('per_page', request.args.get('limit', 10, type=int), type=int)
+    q = Invoice.query
+    ids = _ids_commandes_visibles()
+    if ids is not None: q = q.filter(Invoice.order_id.in_(ids or [0]))
+    q = q.order_by(Invoice.issued_at.desc())
     total = q.count()
-    invoices = q.offset((page-1)*per_page).limit(per_page).all()
-    result = []
-    for inv in invoices:
-        o = Order.query.get(inv.order_id)
-        result.append({'id':inv.id,'order_id':inv.order_id,'order_number':o.order_number if o else '—','invoice_number':inv.invoice_number,'amount':float(inv.amount),'status':inv.status,'issued_at':inv.issued_at.isoformat() if inv.issued_at else None,'paid_at':inv.paid_at.isoformat() if inv.paid_at else None,'due_date':str(inv.due_date) if inv.due_date else None})
-    return jsonify({'status':'success','page':page,'per_page':per_page,'total':total,'invoices':result})
+    return jsonify({'status':'success','page':page,'per_page':per_page,'total':total,'invoices':[_invoice_json(i) for i in q.offset((page-1)*per_page).limit(per_page).all()]})
 
 @shop_bp.route('/invoices', methods=['POST'])
 @token_required
-@admin_required
+@gestionnaire_required
 def shop_create_invoice():
-    data = request.get_json() or {}
-    inv = Invoice(order_id=data.get('order_id'), invoice_number=generate_invoice_number(),
-                  amount=data.get('amount',0), status=data.get('status','pending'),
-                  due_date=datetime.datetime.strptime(data['due_date'],'%Y-%m-%d').date() if data.get('due_date') else None)
-    db.session.add(inv); db.session.commit()
-    return jsonify({'status':'success','invoice':{'id':inv.id,'invoice_number':inv.invoice_number}}), 201
+    return jsonify({'status':'error','message':'Les factures sont créées automatiquement avec chaque commande.'}), 410
 
 @shop_bp.route('/invoices/detail', methods=['GET'])
 @token_required
+@boutique_required
 def shop_get_invoice():
     iid = request.args.get('id', type=int)
-    if not iid: return jsonify({'status':'error','message':'id requis'}), 400
-    inv = Invoice.query.get(iid)
-    if not inv: return jsonify({'status':'error','message':'Facture introuvable'}), 404
-    return jsonify({'status':'success','invoice':{'id':inv.id,'order_id':inv.order_id,'invoice_number':inv.invoice_number,'amount':float(inv.amount),'status':inv.status,'issued_at':inv.issued_at.isoformat() if inv.issued_at else None,'paid_at':inv.paid_at.isoformat() if inv.paid_at else None,'due_date':str(inv.due_date) if inv.due_date else None}})
+    inv = db.session.get(Invoice, iid) if iid else None
+    if not inv or not _commande_visible(db.session.get(Order, inv.order_id)): return jsonify({'status':'error','message':'Facture introuvable'}), 404
+    return jsonify({'status':'success','invoice':_invoice_json(inv)})
 
 @shop_bp.route('/invoices/update', methods=['POST'])
 @token_required
-@admin_required
+@gestionnaire_required
 def shop_update_invoice():
     data = request.get_json() or {}
-    iid = data.get('id')
-    if not iid: return jsonify({'status':'error','message':'id requis'}), 400
-    inv = Invoice.query.get(iid)
+    inv = db.session.get(Invoice, int(data.get('id') or 0)) if str(data.get('id') or '').isdigit() else None
     if not inv: return jsonify({'status':'error','message':'Facture introuvable'}), 404
-    inv.status = data.get('status', inv.status)
-    if data.get('status') == 'paid' and inv.status != 'paid': inv.paid_at = datetime.datetime.utcnow()
-    inv.amount = data.get('amount', inv.amount)
+    if 'status' in data and data.get('status') != inv.status:
+        return jsonify({'status':'error','message':'Une facture devient « payée » uniquement par la validation du paiement Wave de sa commande.'}), 409
     if data.get('due_date'): inv.due_date = datetime.datetime.strptime(data['due_date'],'%Y-%m-%d').date()
     db.session.commit()
     return jsonify({'status':'success','invoice':{'id':inv.id,'status':inv.status}})
 
+# ── Stocks (Gestionnaire) ──────────────────────────────────
 @shop_bp.route('/stock-movements', methods=['GET'])
 @token_required
+@gestionnaire_required
 def shop_list_stock():
     page = request.args.get('page', 1, type=int)
-    per_page = request.args.get('per_page', 10, type=int)
+    per_page = request.args.get('per_page', request.args.get('limit', 10, type=int), type=int)
     product_id = request.args.get('product_id', type=int)
     q = StockMovement.query.order_by(StockMovement.created_at.desc())
     if product_id: q = q.filter_by(product_id=product_id)
     total = q.count()
-    movements = q.offset((page-1)*per_page).limit(per_page).all()
     result = []
-    for m in movements:
-        p = Product.query.get(m.product_id)
+    for m in q.offset((page-1)*per_page).limit(per_page).all():
+        p = db.session.get(Product, m.product_id)
         result.append({'id':m.id,'product_id':m.product_id,'product_name':p.name if p else '—','movement_type':m.movement_type,'quantity':m.quantity,'reason':m.reason,'created_at':m.created_at.isoformat() if m.created_at else None})
     return jsonify({'status':'success','page':page,'per_page':per_page,'total':total,'movements':result})
 
 @shop_bp.route('/stock-movements/add', methods=['POST'])
 @token_required
-@admin_required
+@gestionnaire_required
 def shop_add_stock():
     data = request.get_json() or {}
-    pid = data.get('product_id'); qty = data.get('quantity', 0); mtype = data.get('movement_type', 'in')
-    if not pid: return jsonify({'status':'error','message':'product_id requis'}), 400
-    p = Product.query.get(pid)
+    try:
+        pid = int(data.get('product_id') or 0); qty = int(data.get('quantity', 0) or 0)
+    except (TypeError, ValueError):
+        return jsonify({'status':'error','message':'Produit ou quantité invalide'}), 400
+    mtype = 'out' if data.get('movement_type') == 'out' else 'in'
+    p = db.session.get(Product, pid) if pid else None
     if not p: return jsonify({'status':'error','message':'Produit introuvable'}), 404
+    if qty <= 0: return jsonify({'status':'error','message':'Quantité invalide'}), 400
     if mtype == 'in': p.stock_quantity = (p.stock_quantity or 0) + qty
     else: p.stock_quantity = max(0, (p.stock_quantity or 0) - qty)
     db.session.add(StockMovement(product_id=pid, movement_type=mtype, quantity=qty, reason=data.get('reason','Ajustement manuel')))
@@ -1037,10 +1385,10 @@ def shop_add_stock():
 
 @shop_bp.route('/stock-movements/product', methods=['GET'])
 @token_required
+@gestionnaire_required
 def shop_stock_by_product():
     pid = request.args.get('id', type=int)
-    if not pid: return jsonify({'status':'error','message':'id requis'}), 400
-    p = Product.query.get(pid)
+    p = db.session.get(Product, pid) if pid else None
     if not p: return jsonify({'status':'error','message':'Produit introuvable'}), 404
     movements = StockMovement.query.filter_by(product_id=pid).order_by(StockMovement.created_at.desc()).all()
     return jsonify({'status':'success','product':{'id':p.id,'name':p.name,'stock_quantity':p.stock_quantity},'movements':[{'id':m.id,'movement_type':m.movement_type,'quantity':m.quantity,'reason':m.reason,'created_at':m.created_at.isoformat() if m.created_at else None} for m in movements]})
@@ -1057,6 +1405,7 @@ def stats_overview():
         total_users = User.query.count(); total_campaigns = Campaign.query.filter_by(status='active').count(); total_orders = Order.query.count()
         pending_orders = Order.query.filter_by(payment_status='pending').count()
         paid_orders = Order.query.filter_by(payment_status='paid').count()
+        declared_orders = Order.query.filter_by(payment_status='declared').count()
         total_revenue = db.session.query(db.func.sum(Order.total_amount)).filter_by(payment_status='paid').scalar() or 0
         total_products = Product.query.count(); low_stock = Product.query.filter(Product.stock_quantity <= 5).count()
         total_suppliers = Supplier.query.count(); total_invoices = Invoice.query.count()
@@ -1167,7 +1516,9 @@ def seed():
         db.session.query(Delivery).delete(); db.session.query(OrderItem).delete()
         db.session.query(CartItem).delete(); db.session.query(Product).delete()
         db.session.query(Supplier).delete()
-        db.session.query(Order).delete(); db.session.query(Campaign).delete(); db.session.query(User).delete()
+        db.session.query(Order).delete(); db.session.query(Campaign).delete()
+        for u in User.query.all():   # v2.11.0 : les comptes officiels VoteConnect sont conservés
+            if not est_officiel(u): db.session.delete(u)
         db.session.commit()
 
         users_data = [
@@ -1184,7 +1535,7 @@ def seed():
         created_users = []
         for phone, pin, fn, ln, email, role, status, region, commune, ptype in users_data:
             u = User(phone=phone, pin_hash=hash_pin(pin), first_name=fn, last_name=ln, email=email,
-                     role=role, status=status, region=region, commune=commune, profile_type=ptype, ngd_id=generate_ngd_id())
+                     role='user', status='inactive', region=region, commune=commune, profile_type=ptype, ngd_id=generate_ngd_id())
             db.session.add(u); db.session.commit()
             created_users.append(u)
 
@@ -1250,10 +1601,11 @@ def v1_dashboard_stats():
         total_users = User.query.count(); total_campaigns = Campaign.query.filter_by(status='active').count(); total_orders = Order.query.count()
         pending_orders = Order.query.filter_by(payment_status='pending').count()
         paid_orders = Order.query.filter_by(payment_status='paid').count()
+        declared_orders = Order.query.filter_by(payment_status='declared').count()
         total_revenue = db.session.query(db.func.sum(Order.total_amount)).filter_by(payment_status='paid').scalar() or 0
         total_products = Product.query.count(); low_stock = Product.query.filter(Product.stock_quantity <= 5).count()
         total_suppliers = Supplier.query.count(); total_invoices = Invoice.query.count()
-        return jsonify({'total_users':total_users,'total_campaigns':total_campaigns,'total_orders':total_orders,'pending_orders':pending_orders,'paid_orders':paid_orders,'total_revenue':float(total_revenue),'total_groups':0,'pending_withdrawals':0,'total_products':total_products,'low_stock':low_stock,'total_suppliers':total_suppliers,'total_invoices':total_invoices})
+        return jsonify({'total_users':total_users,'total_campaigns':total_campaigns,'total_orders':total_orders,'pending_orders':pending_orders,'paid_orders':paid_orders,'declared_orders':declared_orders,'total_revenue':float(total_revenue),'total_groups':0,'pending_withdrawals':0,'total_products':total_products,'low_stock':low_stock,'total_suppliers':total_suppliers,'total_invoices':total_invoices})
     except Exception as e:
         db.session.rollback()
         import traceback
@@ -1270,6 +1622,7 @@ def v1_create_campaign(): return create_campaign()
 
 @v1_bp.route('/users', methods=['GET'])
 @token_required
+@annuaire_required
 def v1_list_users(): return list_users()
 
 @v1_bp.route('/orders', methods=['GET'])
@@ -1283,11 +1636,12 @@ def v1_payments_init(): return pay_order()
 @v1_bp.route('/payments/confirm', methods=['POST'])
 @token_required
 def v1_payments_confirm():
-    data = request.get_json() or {}
-    return jsonify({'ok':True,'status':'confirmed','payment_id':data.get('payment_id')})
+    # v2.10.0 — répondait « confirmé » à toute demande, sans rien vérifier : fermée.
+    return jsonify(PAIEMENT_FERME), 410
 
 @v1_bp.route('/export/users', methods=['GET'])
 @token_required
+@gestionnaire_required
 def v1_export_users():
     import csv, io
     output = io.StringIO(); writer = csv.writer(output)
@@ -1303,7 +1657,8 @@ def v1_export_orders():
     import csv, io
     output = io.StringIO(); writer = csv.writer(output)
     writer.writerow(['ID','Numero','Montant','Statut','Paiement','Region','Commune'])
-    for o in Order.query.all(): writer.writerow([o.id,o.order_number,o.total_amount,o.status,o.payment_status,o.region,o.commune])
+    q = Order.query if est_gestionnaire(request.current_user) else Order.query.filter_by(user_id=request.current_user.id)   # v2.11.0
+    for o in q.all(): writer.writerow([o.id,o.order_number,o.total_amount,o.status,o.payment_status,o.region,o.commune])
     output.seek(0)
     from flask import Response
     return Response(output.getvalue(), mimetype='text/csv', headers={'Content-Disposition':'attachment; filename=orders.csv'})
@@ -1393,9 +1748,10 @@ def stats_partenaires():
         indicateurs = {
             'Produits au catalogue': Product.query.filter_by(status='active').count(),
             'Commandes en attente de paiement': Order.query.filter_by(payment_status='pending').count(),
+            'Paiements Wave à vérifier': Order.query.filter_by(payment_status='declared').count(),
             'Commission fournisseurs': f'{COMMISSION_PCT:g} %',
         }
-        return jsonify({'ok': True, 'service': 'coalition509-api', 'version': '2.9.8', 'periode': {'du': str(du), 'au': str(au)}, 'lignes': lignes, 'indicateurs': indicateurs})
+        return jsonify({'ok': True, 'service': 'coalition509-api', 'version': '2.11.0', 'periode': {'du': str(du), 'au': str(au)}, 'lignes': lignes, 'indicateurs': indicateurs})
     except Exception as e:
         db.session.rollback()
         print(f"[STATS-PARTENAIRES] {e}")
@@ -1414,7 +1770,7 @@ app.register_blueprint(shop_bp)
 
 @app.route('/')
 def index():
-    return jsonify({'service':'Coalition 509 API','version':'2.9.8','status':'ok','modules':['auth','campaigns','users','orders','bot','shop']})
+    return jsonify({'service':'Coalition 509 API','version':'2.11.0','status':'ok','modules':['auth','campaigns','users','orders','bot','shop'],'boutique':{'paiement':'Wave — marchand Formation','gestionnaires_configures':len(GESTIONNAIRES_BOUTIQUE)}})
 
 def auto_migrate():
     try:
@@ -1475,13 +1831,34 @@ def auto_migrate():
                 print("[MIGRATE] Colonne 'pricing_model' ajoutee a campaigns")
             else:
                 print("[MIGRATE] Colonne 'pricing_model' deja presente")
+        # v2.10.0 — paiement Wave vérifié
+        with db.engine.connect() as conn:
+            for col, typ in (('wave_reference', 'VARCHAR(40)'), ('payment_declared_at', 'TIMESTAMP'), ('payment_validated_at', 'TIMESTAMP'),
+                             ('payment_validated_by', 'INTEGER'), ('payment_note', 'TEXT')):
+                res = conn.execute(db.text(f"SELECT column_name FROM information_schema.columns WHERE table_name='orders' AND column_name='{col}'"))
+                if not res.fetchone():
+                    conn.execute(db.text(f"ALTER TABLE orders ADD COLUMN {col} {typ}"))
+                    conn.commit()
+                    print(f"[MIGRATE] Colonne '{col}' ajoutee a orders")
+        # v2.11.0 — Candidats Têtes de liste
+        with db.engine.connect() as conn:
+            for col, typ in (('candidature', 'VARCHAR(150)'), ('promoted_at', 'TIMESTAMP'), ('promoted_by', 'INTEGER')):
+                res = conn.execute(db.text(f"SELECT column_name FROM information_schema.columns WHERE table_name='users' AND column_name='{col}'"))
+                if not res.fetchone():
+                    conn.execute(db.text(f"ALTER TABLE users ADD COLUMN {col} {typ}"))
+                    conn.commit()
+                    print(f"[MIGRATE] Colonne '{col}' ajoutee a users")
     except Exception as e:
         print(f"[MIGRATE] {e}")
 
 with app.app_context():
     db.create_all()
-    print("[BOOT] Tables verifiees/creees v2.9.8")
+    print("[BOOT] Tables verifiees/creees v2.11.0")
     auto_migrate()
+    try:
+        preparer_comptes()
+    except Exception as e:
+        db.session.rollback(); print(f"[COMPTES] {e}")
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
