@@ -1,5 +1,7 @@
 """
-Coalition 509 API — Backend v2.11.1
+Coalition 509 API — Backend v2.11.2
+v2.11.2 (15/10/2026) — Annuaire : filtre status= (active | inactive). Le tableau de bord n'affiche par défaut que les
+  comptes actifs, comme le compteur « Utilisateurs actifs » de la Vue d'ensemble.
 v2.11.1 (15/10/2026) — Compteur « Utilisateurs actifs » (tableau de bord) : ne compte plus que les comptes actifs
   (les 9 comptes de démonstration désactivés étaient encore comptés).
 v2.11.0 (15/10/2026) — CANDIDATS TÊTES DE LISTE :
@@ -594,6 +596,9 @@ def list_users():
         ))
     if role in ('admin', 'user', 'superadmin'):
         q = q.filter(User.role == role)
+    statut = request.args.get('status', '').strip().lower()   # v2.11.2
+    if statut == 'active': q = q.filter(db.or_(User.status == 'active', User.status.is_(None)))
+    elif statut == 'inactive': q = q.filter(User.status != 'active')
     total = q.count()
     users = q.offset((page-1)*per_page).limit(per_page).all()
     return jsonify({'status':'success','page':page,'per_page':per_page,'total':total,'users':[user_list_json(u) for u in users]})
@@ -1753,7 +1758,7 @@ def stats_partenaires():
             'Paiements Wave à vérifier': Order.query.filter_by(payment_status='declared').count(),
             'Commission fournisseurs': f'{COMMISSION_PCT:g} %',
         }
-        return jsonify({'ok': True, 'service': 'coalition509-api', 'version': '2.11.1', 'periode': {'du': str(du), 'au': str(au)}, 'lignes': lignes, 'indicateurs': indicateurs})
+        return jsonify({'ok': True, 'service': 'coalition509-api', 'version': '2.11.2', 'periode': {'du': str(du), 'au': str(au)}, 'lignes': lignes, 'indicateurs': indicateurs})
     except Exception as e:
         db.session.rollback()
         print(f"[STATS-PARTENAIRES] {e}")
@@ -1772,7 +1777,7 @@ app.register_blueprint(shop_bp)
 
 @app.route('/')
 def index():
-    return jsonify({'service':'Coalition 509 API','version':'2.11.1','status':'ok','modules':['auth','campaigns','users','orders','bot','shop'],'boutique':{'paiement':'Wave — marchand Formation','gestionnaires_configures':len(GESTIONNAIRES_BOUTIQUE)}})
+    return jsonify({'service':'Coalition 509 API','version':'2.11.2','status':'ok','modules':['auth','campaigns','users','orders','bot','shop'],'boutique':{'paiement':'Wave — marchand Formation','gestionnaires_configures':len(GESTIONNAIRES_BOUTIQUE)}})
 
 def auto_migrate():
     try:
@@ -1855,7 +1860,7 @@ def auto_migrate():
 
 with app.app_context():
     db.create_all()
-    print("[BOOT] Tables verifiees/creees v2.11.1")
+    print("[BOOT] Tables verifiees/creees v2.11.2")
     auto_migrate()
     try:
         preparer_comptes()

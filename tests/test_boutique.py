@@ -105,10 +105,10 @@ def test_parcours_complet(ctx):
     import datetime
     jour = datetime.date.today().isoformat()
     st = j(c.get(f'/api/stats-partenaires?du={jour}&au={jour}', headers={'X-Stats-Key': os.environ['STATS_KEY']}))
-    assert st['ok'] and sum(l['brut'] for l in st['lignes']) == 10000 and st['version'] == '2.11.1'
+    assert st['ok'] and sum(l['brut'] for l in st['lignes']) == 10000 and st['version'] == '2.11.2'
     assert st['indicateurs']['Paiements Wave à vérifier'] == 0
     racine = j(c.get('/'))
-    assert racine['version'] == '2.11.1' and racine['boutique']['gestionnaires_configures'] == 6
+    assert racine['version'] == '2.11.2' and racine['boutique']['gestionnaires_configures'] == 6
 
 def test_produit_vendu_retire_sans_casser_historique(ctx):
     c, H = ctx
@@ -271,3 +271,12 @@ def test_compteur_utilisateurs_actifs(ctx):
     T = {'Authorization': 'Bearer ' + j(c.post('/api/auth/login', json={'phone': '0505761784', 'pin': '2580'}))['token']}   # compte officiel (conservé par /api/seed)
     assert j(c.get('/api/v1/dashboard/stats', headers=T))['total_users'] == actifs
     assert j(c.get('/api/stats/overview', headers=T))['stats']['total_users'] == actifs
+
+def test_annuaire_filtre_statut(ctx):
+    c, H = ctx
+    T = {'Authorization': 'Bearer ' + j(c.post('/api/auth/login', json={'phone': '0505761784', 'pin': '2580'}))['token']}
+    act = j(c.get('/api/v1/users?status=active&limit=200', headers=T)); ina = j(c.get('/api/v1/users?status=inactive&limit=200', headers=T))
+    tous = j(c.get('/api/v1/users?limit=200', headers=T))
+    assert all(u['status'] == 'active' for u in act['users']) and all(u['status'] != 'active' for u in ina['users'])
+    assert act['total'] + ina['total'] == tous['total'] and ina['total'] >= 9
+    assert act['total'] == j(c.get('/api/v1/dashboard/stats', headers=T))['total_users']
